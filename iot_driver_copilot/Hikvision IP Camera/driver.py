@@ -1,211 +1,182 @@
 import os
 import io
+import json
+import time
 import threading
 import requests
-import time
 from flask import Flask, Response, request, jsonify, stream_with_context, abort
 
 app = Flask(__name__)
 
-# Configuration from environment variables
-CAMERA_IP = os.environ.get('CAMERA_IP')
-CAMERA_RTSP_PORT = int(os.environ.get('CAMERA_RTSP_PORT', '554'))
-CAMERA_HTTP_PORT = int(os.environ.get('CAMERA_HTTP_PORT', '80'))
-CAMERA_USER = os.environ.get('CAMERA_USER', 'admin')
-CAMERA_PASSWORD = os.environ.get('CAMERA_PASSWORD', '12345')
+# Environment variables for configuration
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
+DEVICE_SNAPSHOT_PORT = int(os.environ.get('DEVICE_SNAPSHOT_PORT', '80'))
+DEVICE_USERNAME = os.environ.get('DEVICE_USERNAME', 'admin')
+DEVICE_PASSWORD = os.environ.get('DEVICE_PASSWORD', '12345')
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
 
-# Camera endpoints (Hikvision standard)
-SNAPSHOT_URL = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/Streaming/channels/101/picture"
-STATUS_URL = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/System/status"
-PTZ_URL = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/PTZCtrl/channels/1/continuous"
-# RTSP Stream URL
-RTSP_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}/Streaming/Channels/101/"
+# Camera API endpoints
+RTSP_STREAM_PATH = os.environ.get('RTSP_STREAM_PATH', '/Streaming/Channels/101')
+SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
+PTZ_PATH = os.environ.get('PTZ_PATH', '/ISAPI/PTZCtrl/channels/1/continuous')
+STATUS_PATH = os.environ.get('STATUS_PATH', '/ISAPI/System/status')
 
-# --- Video Streaming Proxy (RTSP to MJPEG over HTTP) ---
+# Session state
+active_streams = {}
 
-import cv2
-import base64
+def device_rtsp_url():
+    return f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
 
-class CameraStream:
-    def __init__(self, rtsp_url, user, password):
-        self.rtsp_url = rtsp_url
-        self.user = user
-        self.password = password
-        self.cap = None
-        self.lock = threading.Lock()
-        self.running = False
-        self.last_frame = None
-        self.thread = None
+def device_snapshot_url():
+    return f"http://{DEVICE_IP}:{DEVICE_SNAPSHOT_PORT}{SNAPSHOT_PATH}"
 
-    def start(self):
-        with self.lock:
-            if not self.running:
-                self.cap = cv2.VideoCapture(self.rtsp_url)
-                self.running = True
-                self.thread = threading.Thread(target=self._update, daemon=True)
-                self.thread.start()
+def device_status_url():
+    return f"http://{DEVICE_IP}:{DEVICE_SNAPSHOT_PORT}{STATUS_PATH}"
 
-    def stop(self):
-        with self.lock:
-            self.running = False
-            if self.cap:
-                self.cap.release()
-                self.cap = None
+def device_ptz_url():
+    return f"http://{DEVICE_IP}:{DEVICE_SNAPSHOT_PORT}{PTZ_PATH}"
 
-    def _update(self):
-        while self.running and self.cap and self.cap.isOpened():
-            ret, frame = self.cap.read()
-            if ret:
-                # Encode as JPEG
-                ret2, jpeg = cv2.imencode('.jpg', frame)
-                if ret2:
-                    self.last_frame = jpeg.tobytes()
-            else:
-                # Try to reconnect after a brief pause
-                time.sleep(1)
-                if self.cap:
-                    self.cap.release()
-                self.cap = cv2.VideoCapture(self.rtsp_url)
-        if self.cap:
-            self.cap.release()
-
-    def get_frame(self):
-        with self.lock:
-            return self.last_frame
-
-streamer = CameraStream(RTSP_URL, CAMERA_USER, CAMERA_PASSWORD)
-
-# --- Snapshot API ---
-
-@app.route("/camera/snapshot", methods=["GET"])
-def camera_snapshot():
-    url = SNAPSHOT_URL
+def get_device_status():
     try:
-        resp = requests.get(url, auth=(CAMERA_USER, CAMERA_PASSWORD), timeout=5, stream=True)
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
-            return Response(resp.content, mimetype='image/jpeg')
-        else:
-            # As fallback, grab from RTSP stream
-            streamer.start()
-            frame = streamer.get_frame()
-            if frame is not None:
-                return Response(frame, mimetype='image/jpeg')
-            else:
-                return "Unable to capture snapshot", 503
-    except Exception as ex:
-        # Try fallback as above
-        streamer.start()
-        frame = streamer.get_frame()
-        if frame is not None:
-            return Response(frame, mimetype='image/jpeg')
-        else:
-            return "Unable to capture snapshot", 503
+        resp = requests.get(device_status_url(), auth=(DEVICE_USERNAME, DEVICE_PASSWORD), timeout=3)
+        return resp.json()
+    except Exception as e:
+        return {
+            "online": False,
+            "error": str(e)
+        }
 
-# --- Video Stream API (MJPEG over HTTP) ---
+def get_snapshot_bytes():
+    try:
+        resp = requests.get(device_snapshot_url(), auth=(DEVICE_USERNAME, DEVICE_PASSWORD), stream=True, timeout=5)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as e:
+        return None
 
-def gen_mjpeg():
-    streamer.start()
-    while True:
-        frame = streamer.get_frame()
-        if frame:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        else:
-            time.sleep(0.1)
-
-@app.route("/camera/stream", methods=["GET"])
-def camera_stream():
-    return Response(gen_mjpeg(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route("/camera/stream", methods=["DELETE"])
-def stop_camera_stream():
-    streamer.stop()
-    return jsonify({"status": "stopped"}), 200
-
-# --- Camera Status API ---
-
-@app.route("/camera/status", methods=["GET"])
-def camera_status():
-    # Get online/offline and PTZ position
-    status = {
-        "online": False,
-        "streaming": streamer.running,
-        "ptz": None
+def send_ptz_command(direction=None, speed=5, stop=False):
+    """
+    Hikvision ISAPI PTZ control. Example: move left/right/up/down/zoom_in/zoom_out/stop
+    """
+    mapping = {
+        "left": {"pan": -speed, "tilt": 0, "zoom": 0},
+        "right": {"pan": speed, "tilt": 0, "zoom": 0},
+        "up": {"pan": 0, "tilt": speed, "zoom": 0},
+        "down": {"pan": 0, "tilt": -speed, "zoom": 0},
+        "zoom_in": {"pan": 0, "tilt": 0, "zoom": speed},
+        "zoom_out": {"pan": 0, "tilt": 0, "zoom": -speed},
+        "stop": {"pan": 0, "tilt": 0, "zoom": 0}
     }
-    # Try connection to camera status endpoint
+    if stop:
+        action = mapping["stop"]
+    else:
+        if direction not in mapping:
+            return False, "Invalid direction"
+        action = mapping[direction]
+
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<PTZData>
+    <pan>{action['pan']}</pan>
+    <tilt>{action['tilt']}</tilt>
+    <zoom>{action['zoom']}</zoom>
+</PTZData>"""
     try:
-        resp = requests.get(STATUS_URL, auth=(CAMERA_USER, CAMERA_PASSWORD), timeout=3)
-        if resp.status_code == 200:
-            status["online"] = True
-    except Exception:
-        status["online"] = False
-    # Get last PTZ position (best effort)
+        resp = requests.put(device_ptz_url(), data=xml, auth=(DEVICE_USERNAME, DEVICE_PASSWORD), headers={'Content-Type': 'application/xml'}, timeout=3)
+        if resp.status_code in (200, 201, 204):
+            return True, "OK"
+        else:
+            return False, f"PTZ HTTP {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return False, str(e)
+
+def rtsp_to_mjpeg(rtsp_url):
+    """
+    Use OpenCV to connect to RTSP, read H.264 frames, encode as JPEG, and stream as MJPEG.
+    """
+    import cv2
+
+    cap = cv2.VideoCapture(rtsp_url)
+    if not cap.isOpened():
+        yield b''
+        return
+
     try:
-        ptz_status_url = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/PTZCtrl/channels/1/status"
-        resp = requests.get(ptz_status_url, auth=(CAMERA_USER, CAMERA_PASSWORD), timeout=3)
-        if resp.status_code == 200:
-            # Hikvision XML; parse simple fields
-            import xml.etree.ElementTree as ET
-            try:
-                root = ET.fromstring(resp.content)
-                pan = root.find('.//absoluteHigh').text if root.find('.//absoluteHigh') is not None else None
-                tilt = root.find('.//absoluteTilt').text if root.find('.//absoluteTilt') is not None else None
-                zoom = root.find('.//absoluteZoom').text if root.find('.//absoluteZoom') is not None else None
-                status["ptz"] = {
-                    "pan": pan,
-                    "tilt": tilt,
-                    "zoom": zoom
-                }
-            except Exception:
-                status["ptz"] = None
-    except Exception:
-        status["ptz"] = None
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            _, jpeg = cv2.imencode('.jpg', frame)
+            jpg_bytes = jpeg.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
+    finally:
+        cap.release()
+
+@app.route('/status', methods=['GET'])
+@app.route('/camera/status', methods=['GET'])
+def camera_status():
+    status = get_device_status()
     return jsonify(status)
 
-# --- PTZ Control API ---
+@app.route('/snapshot', methods=['GET'])
+@app.route('/camera/snapshot', methods=['GET'])
+def snapshot():
+    image = get_snapshot_bytes()
+    if image is None:
+        abort(503)
+    return Response(image, mimetype='image/jpeg')
 
-@app.route("/camera/ptz", methods=["POST"])
-def camera_ptz():
+@app.route('/stream', methods=['GET'])
+@app.route('/camera/stream', methods=['GET'])
+def stream():
+    # Each client gets a new RTSP session
+    rtsp_url = device_rtsp_url()
+    def generate():
+        for frame in rtsp_to_mjpeg(rtsp_url):
+            yield frame
+    response = Response(stream_with_context(generate()), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return response
+
+@app.route('/stream', methods=['DELETE'])
+@app.route('/camera/stream', methods=['DELETE'])
+def stop_stream():
+    # Since each HTTP request is stateless, client just closes the connection to stop stream.
+    return jsonify({"status": "stream stopped"}), 200
+
+@app.route('/ptz/move', methods=['POST'])
+def ptz_move():
     data = request.get_json(force=True)
-    action = data.get("action")
-    value = data.get("value", 0)
-    speed = data.get("speed", 1)
+    direction = data.get('direction')
+    speed = int(data.get('speed', 5))
+    stop = direction == 'stop'
+    ok, msg = send_ptz_command(direction, speed, stop)
+    status = "success" if ok else "error"
+    code = 200 if ok else 400
+    return jsonify({"status": status, "message": msg}), code
 
-    # Map action to Hikvision PTZ XML
-    # actions: "pan_left", "pan_right", "tilt_up", "tilt_down", "zoom_in", "zoom_out", or "stop"
-    ptz_cmds = {
-        "pan_left":   {"pan": -speed, "tilt": 0, "zoom": 0},
-        "pan_right":  {"pan": speed,  "tilt": 0, "zoom": 0},
-        "tilt_up":    {"pan": 0, "tilt": speed,  "zoom": 0},
-        "tilt_down":  {"pan": 0, "tilt": -speed, "zoom": 0},
-        "zoom_in":    {"pan": 0, "tilt": 0, "zoom": speed},
-        "zoom_out":   {"pan": 0, "tilt": 0, "zoom": -speed},
-        "stop":       {"pan": 0, "tilt": 0, "zoom": 0}
-    }
-    if action in ptz_cmds:
-        ptz = ptz_cmds[action]
-        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<PTZData>
-    <pan>{ptz['pan']}</pan>
-    <tilt>{ptz['tilt']}</tilt>
-    <zoom>{ptz['zoom']}</zoom>
-</PTZData>
-"""
-        url = PTZ_URL
-        headers = {'Content-Type': 'application/xml'}
-        try:
-            resp = requests.put(url, data=xml, headers=headers, auth=(CAMERA_USER, CAMERA_PASSWORD), timeout=2)
-            if resp.status_code in (200, 201, 204):
-                return jsonify({"result": "success"}), 200
-            else:
-                return jsonify({"result": "error", "details": resp.text}), 400
-        except Exception as ex:
-            return jsonify({"result": "error", "details": str(ex)}), 500
+@app.route('/camera/ptz', methods=['POST'])
+def ptz_action():
+    data = request.get_json(force=True)
+    action = data.get('action')
+    value = int(data.get('value', 0))
+    speed = int(data.get('speed', 5))
+    direction = None
+    if action == "zoom":
+        direction = "zoom_in" if value > 0 else "zoom_out"
+    elif action in ("left", "right", "up", "down"):
+        direction = action
+    elif action == "stop":
+        direction = "stop"
     else:
-        return jsonify({"result": "error", "details": "Unknown PTZ action"}), 400
+        return jsonify({"status": "error", "message": "Invalid PTZ action"}), 400
+
+    stop = (direction == "stop")
+    ok, msg = send_ptz_command(direction, speed, stop)
+    status = "success" if ok else "error"
+    code = 200 if ok else 400
+    return jsonify({"status": status, "message": msg}), code
 
 if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
