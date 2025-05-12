@@ -1,382 +1,315 @@
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
+#include <cstdlib>
+#include <string>
 #include <thread>
-#include <vector>
-#include <atomic>
-#include <sstream>
 #include <chrono>
+#include <vector>
+#include <map>
+#include <sstream>
+#include <memory>
+#include <cstring>
 #include <mutex>
 #include <condition_variable>
-#include <unordered_map>
-#include <functional>
-#include <csignal>
+#include <nlohmann/json.hpp>
 
-// HTTP server
-#include <netinet/in.h>
-#include <unistd.h>
-#include <sys/socket.h>
-
-// ROS2
+// ROS2 headers
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_srvs/srv/trigger.hpp"
-#include "std_msgs/msg/bool.hpp"
-#include "std_msgs/msg/float64_multi_array.hpp"
+#include "std_srvs/srv/empty.hpp"
+#include "geometry_msgs/msg/pose.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 
-// ----------- Config
-#define ENV_STR(x) (std::getenv(x) ? std::getenv(x) : "")
+// HTTP Server (simple, header-only, no external lib)
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
 
-struct Config {
-    std::string ros_domain_id;
-    std::string ros_namespace;
-    std::string robot_ip;
-    std::string http_host;
-    int http_port;
-    Config() {
-        ros_domain_id = ENV_STR("ROS_DOMAIN_ID");
-        ros_namespace = ENV_STR("ROS_NAMESPACE");
-        robot_ip = ENV_STR("ROBOT_IP");
-        http_host = ENV_STR("HTTP_HOST");
-        http_port = std::atoi(ENV_STR("HTTP_PORT"));
-        if(http_host.empty()) http_host = "0.0.0.0";
-        if(http_port == 0) http_port = 8080;
-    }
-};
+using json = nlohmann::json;
 
-Config config;
+// ========== Environment Variable Helper ==========
+std::string getenv_or(const char* name, const std::string& fallback) {
+    const char* val = std::getenv(name);
+    return val ? std::string(val) : fallback;
+}
 
-// ----------- Globals for robot data
-std::mutex robot_mutex;
-sensor_msgs::msg::JointState::SharedPtr last_joint_state;
-std::string last_robot_status;
-std::string last_controller_state;
-std::string last_planning_groups;
+// ========== ROS2 Node Wrapper ==========
 
-// For shutdown
-std::atomic<bool> g_shutdown{false};
-
-// ----------- ROS2 Node
-class RobotBridgeNode : public rclcpp::Node {
+class RobotState : public rclcpp::Node {
 public:
-    RobotBridgeNode() : Node("fairino_robot_driver") {
-        // Subscriptions
+    RobotState(const std::string& node_name)
+        : Node(node_name)
+    {
         joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
-            "/joint_states", 10,
-            [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
-                std::lock_guard<std::mutex> lk(robot_mutex);
-                last_joint_state = msg;
-            }
+            getenv_or("FAIRINO_JOINT_STATE_TOPIC", "/joint_states"), 10,
+            std::bind(&RobotState::joint_state_callback, this, std::placeholders::_1)
         );
-        robot_status_sub_ = this->create_subscription<std_msgs::msg::String>(
-            "/robot_status", 10,
-            [](const std_msgs::msg::String::SharedPtr msg){
-                std::lock_guard<std::mutex> lk(robot_mutex);
-                last_robot_status = msg->data;
-            }
-        );
-        controller_state_sub_ = this->create_subscription<std_msgs::msg::String>(
-            "/controller_state", 10,
-            [](const std_msgs::msg::String::SharedPtr msg){
-                std::lock_guard<std::mutex> lk(robot_mutex);
-                last_controller_state = msg->data;
-            }
+        status_sub_ = this->create_subscription<std_msgs::msg::String>(
+            getenv_or("FAIRINO_STATUS_TOPIC", "/robot_status"), 10,
+            std::bind(&RobotState::status_callback, this, std::placeholders::_1)
         );
         planning_groups_sub_ = this->create_subscription<std_msgs::msg::String>(
-            "/planning_groups", 10,
-            [](const std_msgs::msg::String::SharedPtr msg){
-                std::lock_guard<std::mutex> lk(robot_mutex);
-                last_planning_groups = msg->data;
-            }
+            getenv_or("FAIRINO_PLANNING_GROUPS_TOPIC", "/planning_groups"), 10,
+            std::bind(&RobotState::planning_groups_callback, this, std::placeholders::_1)
         );
-        // Publishers for movement commands
-        joint_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>(
-            "/joint_position_controller/commands", 10);
-        moveit_cmd_pub_ = this->create_publisher<std_msgs::msg::String>(
-            "/moveit2/planning_command", 10);
+        controller_state_sub_ = this->create_subscription<std_msgs::msg::String>(
+            getenv_or("FAIRINO_CONTROLLER_STATE_TOPIC", "/controller_state"), 10,
+            std::bind(&RobotState::controller_state_callback, this, std::placeholders::_1)
+        );
+        // For movement and control - services and publishers
+        plan_client_ = this->create_client<std_srvs::srv::Trigger>(
+            getenv_or("FAIRINO_PLAN_SERVICE", "/plan_execution")
+        );
+        joint_ctrl_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
+            getenv_or("FAIRINO_JOINT_CTRL_TOPIC", "/joint_ctrl"), 10
+        );
     }
 
-    // For /plan endpoint (MoveIt2 planning execution)
-    bool execute_plan(const std::string& plan_json) {
-        std_msgs::msg::String msg;
-        msg.data = plan_json;
-        moveit_cmd_pub_->publish(msg);
-        return true;
+    // --- Data Storage ---
+    std::mutex data_mutex_;
+    sensor_msgs::msg::JointState last_joint_state_;
+    std::string last_status_;
+    std::string last_planning_groups_;
+    std::string last_controller_state_;
+
+    // --- Callbacks ---
+    void joint_state_callback(const sensor_msgs::msg::JointState::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        last_joint_state_ = *msg;
+    }
+    void status_callback(const std_msgs::msg::String::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        last_status_ = msg->data;
+    }
+    void planning_groups_callback(const std_msgs::msg::String::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        last_planning_groups_ = msg->data;
+    }
+    void controller_state_callback(const std_msgs::msg::String::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        last_controller_state_ = msg->data;
     }
 
-    // For /jctrl endpoint (Joint position control)
-    bool send_joint_positions(const std::vector<double>& positions) {
-        std_msgs::msg::Float64MultiArray msg;
-        msg.data = positions;
-        joint_cmd_pub_->publish(msg);
+    // --- Data Getters for HTTP ---
+    json get_status_json() {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        json j;
+        j["status"] = last_status_;
+        j["controller_state"] = last_controller_state_;
+        j["planning_groups"] = last_planning_groups_;
+        return j;
+    }
+
+    json get_joints_json() {
+        std::lock_guard<std::mutex> lock(data_mutex_);
+        json j;
+        j["joint_names"] = last_joint_state_.name;
+        j["positions"] = last_joint_state_.position;
+        j["velocities"] = last_joint_state_.velocity;
+        j["efforts"] = last_joint_state_.effort;
+        return j;
+    }
+
+    // --- Plan Execution (POST /plan) ---
+    bool execute_plan() {
+        if(!plan_client_->wait_for_service(std::chrono::milliseconds(300))) {
+            return false;
+        }
+        auto req = std::make_shared<std_srvs::srv::Trigger::Request>();
+        auto future = plan_client_->async_send_request(req);
+        if(future.wait_for(std::chrono::seconds(3)) == std::future_status::ready) {
+            auto resp = future.get();
+            return resp->success;
+        }
+        return false;
+    }
+
+    // --- Joint Control (POST /jctrl) ---
+    bool set_joint_positions(const std::vector<std::string>& names, const std::vector<double>& positions) {
+        if(names.size() != positions.size() || names.empty())
+            return false;
+        auto msg = sensor_msgs::msg::JointState();
+        msg.name = names;
+        msg.position = positions;
+        joint_ctrl_pub_->publish(msg);
         return true;
     }
 
 private:
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_status_sub_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr controller_state_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr status_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr planning_groups_sub_;
-    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_cmd_pub_;
-    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr moveit_cmd_pub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr controller_state_sub_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr plan_client_;
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_ctrl_pub_;
 };
 
-// ----------- Minimal HTTP server
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::string body;
-    std::unordered_map<std::string, std::string> headers;
-};
+// ========== Minimal HTTP Server ==========
 
-struct HttpResponse {
-    int status = 200;
-    std::string content_type = "application/json";
-    std::string body;
-};
+class SimpleHTTPServer {
+public:
+    SimpleHTTPServer(const std::string& host, int port)
+        : host_(host), port_(port), sockfd_(-1) {}
 
-std::string http_status_message(int status) {
-    switch(status) {
-        case 200: return "OK";
-        case 400: return "Bad Request";
-        case 404: return "Not Found";
-        case 405: return "Method Not Allowed";
-        default:  return "Internal Server Error";
+    bool start(std::function<void(int, const std::string&, const std::string&, const std::map<std::string, std::string>&, const std::string&)> handler) {
+        sockfd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd_ < 0) return false;
+
+        int opt = 1;
+        setsockopt(sockfd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in server_addr;
+        std::memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(port_);
+
+        if (bind(sockfd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            close(sockfd_);
+            return false;
+        }
+        if (listen(sockfd_, 10) < 0) {
+            close(sockfd_);
+            return false;
+        }
+
+        std::thread([this, handler]() { this->accept_loop(handler); }).detach();
+        return true;
     }
-}
 
-void send_http_response(int client_fd, const HttpResponse& resp) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 " << resp.status << " " << http_status_message(resp.status) << "\r\n";
-    oss << "Content-Type: " << resp.content_type << "\r\n";
-    oss << "Access-Control-Allow-Origin: *\r\n";
-    oss << "Content-Length: " << resp.body.size() << "\r\n\r\n";
-    oss << resp.body;
-    std::string out = oss.str();
-    send(client_fd, out.data(), out.size(), 0);
-}
+    void stop() {
+        if (sockfd_ > 0) close(sockfd_);
+    }
 
-bool parse_http_request(const std::string& raw, HttpRequest& req) {
-    std::istringstream iss(raw);
-    std::string line;
-    if(!std::getline(iss, line)) return false;
-    std::istringstream l1(line);
-    l1 >> req.method >> req.path;
-    while(std::getline(iss, line) && line != "\r") {
-        if(line.empty() || line == "\r\n") break;
-        auto pos = line.find(':');
-        if(pos != std::string::npos) {
-            std::string key = line.substr(0, pos);
-            std::string value = line.substr(pos+1);
-            while(!value.empty() && (value[0] == ' ' || value[0] == '\t')) value.erase(0,1);
-            value.erase(value.find_last_not_of("\r\n")+1);
-            req.headers[key] = value;
+private:
+    std::string host_;
+    int port_;
+    int sockfd_;
+
+    void accept_loop(std::function<void(int, const std::string&, const std::string&, const std::map<std::string, std::string>&, const std::string&)> handler) {
+        while (true) {
+            int client = accept(sockfd_, nullptr, nullptr);
+            if (client < 0) continue;
+
+            std::thread([handler, client]() {
+                char buffer[8192];
+                ssize_t received = recv(client, buffer, sizeof(buffer), 0);
+                if (received <= 0) { close(client); return; }
+                std::string request(buffer, received);
+
+                std::istringstream stream(request);
+                std::string req_line;
+                getline(stream, req_line);
+                std::istringstream req_line_stream(req_line);
+                std::string method, path, version;
+                req_line_stream >> method >> path >> version;
+
+                std::map<std::string, std::string> headers;
+                std::string header;
+                while (getline(stream, header) && header != "\r") {
+                    auto colon = header.find(':');
+                    if (colon != std::string::npos) {
+                        std::string name = header.substr(0, colon);
+                        std::string value = header.substr(colon + 1);
+                        while (!value.empty() && (value[0] == ' ' || value[0] == '\t')) value.erase(0, 1);
+                        if (!value.empty() && value.back() == '\r') value.pop_back();
+                        headers[name] = value;
+                    }
+                }
+                std::string body;
+                if (headers.count("Content-Length")) {
+                    int len = std::stoi(headers["Content-Length"]);
+                    body.resize(len);
+                    stream.read(&body[0], len);
+                }
+
+                handler(client, method, path, headers, body);
+                close(client);
+            }).detach();
         }
     }
-    if(req.headers.count("Content-Length")) {
-        int len = std::stoi(req.headers["Content-Length"]);
-        std::string body(len, '\0');
-        iss.read(&body[0], len);
-        req.body = body;
-    }
-    return true;
-}
+};
 
-std::string json_escape(const std::string& s) {
+// ========== HTTP Handler ==========
+void send_response(int client, int code, const std::string& content_type, const std::string& body) {
     std::ostringstream oss;
-    for(auto c : s) {
-        if(c == '\"') oss << "\\\"";
-        else if(c == '\\') oss << "\\\\";
-        else if(c == '\n') oss << "\\n";
-        else if(c == '\r') oss << "\\r";
-        else oss << c;
-    }
-    return oss.str();
+    oss << "HTTP/1.1 " << code << " " << (code == 200 ? "OK" : "ERROR") << "\r\n";
+    oss << "Content-Type: " << content_type << "\r\n";
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Access-Control-Allow-Origin: *\r\n";
+    oss << "\r\n";
+    oss << body;
+    std::string resp = oss.str();
+    send(client, resp.data(), resp.size(), 0);
 }
 
-// ----------- Endpoint Handlers
-
-HttpResponse handle_status() {
-    std::lock_guard<std::mutex> lk(robot_mutex);
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"robot_status\":\"" << json_escape(last_robot_status) << "\",";
-    oss << "\"controller_state\":\"" << json_escape(last_controller_state) << "\",";
-    oss << "\"planning_groups\":\"" << json_escape(last_planning_groups) << "\"";
-    oss << "}";
-    HttpResponse resp; resp.body = oss.str(); return resp;
-}
-
-HttpResponse handle_joints() {
-    std::lock_guard<std::mutex> lk(robot_mutex);
-    HttpResponse resp;
-    if(!last_joint_state) {
-        resp.status = 503;
-        resp.body = "{\"error\":\"Joint state unavailable\"}";
-        return resp;
-    }
-    std::ostringstream oss;
-    oss << "{";
-    oss << "\"name\":[";
-    for(size_t i=0; i<last_joint_state->name.size(); ++i) {
-        if(i) oss << ",";
-        oss << "\"" << json_escape(last_joint_state->name[i]) << "\"";
-    }
-    oss << "],\"position\":[";
-    for(size_t i=0; i<last_joint_state->position.size(); ++i) {
-        if(i) oss << ",";
-        oss << last_joint_state->position[i];
-    }
-    oss << "],\"velocity\":[";
-    for(size_t i=0; i<last_joint_state->velocity.size(); ++i) {
-        if(i) oss << ",";
-        oss << last_joint_state->velocity[i];
-    }
-    oss << "],\"effort\":[";
-    for(size_t i=0; i<last_joint_state->effort.size(); ++i) {
-        if(i) oss << ",";
-        oss << last_joint_state->effort[i];
-    }
-    oss << "]}";
-    resp.body = oss.str();
-    return resp;
-}
-
-HttpResponse handle_plan(RobotBridgeNode* node, const HttpRequest& req) {
-    HttpResponse resp;
-    if(req.body.empty()) {
-        resp.status = 400;
-        resp.body = "{\"error\":\"Missing request body\"}";
-        return resp;
-    }
-    if(node->execute_plan(req.body)) {
-        resp.body = "{\"result\":\"Plan command sent\"}";
-    } else {
-        resp.status = 500;
-        resp.body = "{\"error\":\"Failed to send plan command\"}";
-    }
-    return resp;
-}
-
-HttpResponse handle_jctrl(RobotBridgeNode* node, const HttpRequest& req) {
-    HttpResponse resp;
-    // Expect body as JSON: {"positions":[...]}
-    size_t pos = req.body.find("\"positions\"");
-    if(pos == std::string::npos) {
-        resp.status = 400;
-        resp.body = "{\"error\":\"Missing 'positions' field in body\"}";
-        return resp;
-    }
-    size_t arr_start = req.body.find('[', pos);
-    size_t arr_end = req.body.find(']', arr_start);
-    if(arr_start == std::string::npos || arr_end == std::string::npos) {
-        resp.status = 400;
-        resp.body = "{\"error\":\"Malformed 'positions' array\"}";
-        return resp;
-    }
-    std::vector<double> positions;
-    std::string arr = req.body.substr(arr_start+1, arr_end-arr_start-1);
-    std::istringstream iss(arr);
-    std::string v;
-    while(std::getline(iss, v, ',')) {
-        try {
-            positions.push_back(std::stod(v));
-        } catch(...) {}
-    }
-    if(node->send_joint_positions(positions)) {
-        resp.body = "{\"result\":\"Joint positions sent\"}";
-    } else {
-        resp.status = 500;
-        resp.body = "{\"error\":\"Failed to send joint positions\"}";
-    }
-    return resp;
-}
-
-// ----------- HTTP server loop
-void http_server_thread(RobotBridgeNode* node) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if(server_fd < 0) {
-        perror("socket");
-        std::exit(1);
-    }
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(config.http_port);
-    addr.sin_addr.s_addr = inet_addr(config.http_host.c_str());
-    if(bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        std::exit(1);
-    }
-    if(listen(server_fd, 5) < 0) {
-        perror("listen");
-        close(server_fd);
-        std::exit(1);
-    }
-    while(!g_shutdown) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(server_fd, &rfds);
-        struct timeval tv;
-        tv.tv_sec = 1; tv.tv_usec = 0;
-        int rv = select(server_fd+1, &rfds, NULL, NULL, &tv);
-        if(rv == 0) continue;
-        if(rv < 0) break;
-        int client_fd = accept(server_fd, NULL, NULL);
-        if(client_fd < 0) continue;
-        std::thread([node, client_fd]() {
-            char buf[4096];
-            ssize_t n = recv(client_fd, buf, sizeof(buf)-1, 0);
-            if(n <= 0) { close(client_fd); return; }
-            buf[n] = 0;
-            HttpRequest req;
-            if(!parse_http_request(buf, req)) {
-                HttpResponse resp; resp.status = 400; resp.body = "{\"error\":\"Bad request\"}";
-                send_http_response(client_fd, resp);
-                close(client_fd);
+void handle_http_request(int client, const std::string& method, const std::string& path,
+                        const std::map<std::string, std::string>& headers,
+                        const std::string& body,
+                        std::shared_ptr<RobotState> robot) {
+    try {
+        if (method == "GET" && path == "/status") {
+            auto status = robot->get_status_json();
+            send_response(client, 200, "application/json", status.dump());
+        } else if (method == "GET" && path == "/joints") {
+            auto joints = robot->get_joints_json();
+            send_response(client, 200, "application/json", joints.dump());
+        } else if (method == "POST" && path == "/plan") {
+            bool ok = robot->execute_plan();
+            json resp;
+            resp["success"] = ok;
+            send_response(client, 200, "application/json", resp.dump());
+        } else if (method == "POST" && path == "/jctrl") {
+            json req = json::parse(body);
+            if (!req.contains("joint_names") || !req.contains("positions") ||
+                !req["joint_names"].is_array() || !req["positions"].is_array() ||
+                req["joint_names"].size() != req["positions"].size()) {
+                send_response(client, 400, "application/json", R"({"error":"invalid input"})");
                 return;
             }
-            HttpResponse resp;
-            if(req.method == "GET" && req.path == "/status") {
-                resp = handle_status();
-            } else if(req.method == "GET" && req.path == "/joints") {
-                resp = handle_joints();
-            } else if(req.method == "POST" && req.path == "/plan") {
-                resp = handle_plan(node, req);
-            } else if(req.method == "POST" && req.path == "/jctrl") {
-                resp = handle_jctrl(node, req);
-            } else {
-                resp.status = 404;
-                resp.body = "{\"error\":\"Not found\"}";
-            }
-            send_http_response(client_fd, resp);
-            close(client_fd);
-        }).detach();
+            std::vector<std::string> names = req["joint_names"].get<std::vector<std::string>>();
+            std::vector<double> positions = req["positions"].get<std::vector<double>>();
+            bool ok = robot->set_joint_positions(names, positions);
+            json resp;
+            resp["success"] = ok;
+            send_response(client, 200, "application/json", resp.dump());
+        } else {
+            send_response(client, 404, "application/json", R"({"error":"not found"})");
+        }
+    } catch (...) {
+        send_response(client, 500, "application/json", R"({"error":"internal server error"})");
     }
-    close(server_fd);
 }
 
-// ----------- Signal handler
-void handle_signal(int) {
-    g_shutdown = true;
-}
+// ========== Main Entrypoint ==========
+int main(int argc, char* argv[]) {
+    // Environment - config
+    std::string ros_domain = getenv_or("ROS_DOMAIN_ID", "0");
+    std::string ros_namespace = getenv_or("ROS_NAMESPACE", "");
+    std::string http_host = getenv_or("HTTP_HOST", "0.0.0.0");
+    int http_port = std::stoi(getenv_or("HTTP_PORT", "8080"));
 
-// ----------- Main
-int main(int argc, char** argv) {
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
+    setenv("ROS_DOMAIN_ID", ros_domain.c_str(), 1);
+    if (!ros_namespace.empty())
+        setenv("ROS_NAMESPACE", ros_namespace.c_str(), 1);
+
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<RobotBridgeNode>();
-    std::thread th([&](){ http_server_thread(node.get()); });
-    while(rclcpp::ok() && !g_shutdown) {
-        rclcpp::spin_some(node);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto robot = std::make_shared<RobotState>("fairino_robot_http_node");
+
+    SimpleHTTPServer server(http_host, http_port);
+    if (!server.start([robot](int client, const std::string& method, const std::string& path,
+                              const std::map<std::string, std::string>& headers, const std::string& body) {
+        handle_http_request(client, method, path, headers, body, robot);
+    })) {
+        std::cerr << "Failed to start HTTP server on " << http_host << ":" << http_port << std::endl;
+        return 1;
     }
-    g_shutdown = true;
-    th.join();
+
+    std::cout << "Fairino Robot HTTP server running on " << http_host << ":" << http_port << std::endl;
+    rclcpp::spin(robot);
     rclcpp::shutdown();
+    server.stop();
     return 0;
 }
