@@ -1,509 +1,289 @@
-#include <iostream>
 #include <cstdlib>
-#include <string>
-#include <thread>
 #include <memory>
-#include <map>
+#include <string>
 #include <vector>
-#include <chrono>
-#include <sstream>
-#include <algorithm>
+#include <map>
+#include <thread>
 #include <mutex>
-#include <condition_variable>
-#include <atomic>
-#include <csignal>
+#include <sstream>
+#include <iostream>
+#include <functional>
+#include <algorithm>
+#include <chrono>
 
-// HTTP Server dependencies
-#include <asio.hpp>
+#include "httplib.h"
+#include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/string.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
+#include "geometry_msgs/msg/pose.hpp"
 
-// ROS2 dependencies
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/string.hpp>
+// NOTE: You need to add dependencies to httplib.h (https://github.com/yhirose/cpp-httplib) and ROS2 client libraries.
 
-// Custom Fairino message types (replace with actual message/service definitions)
-#include "fairino_msgs/msg/robot_state.hpp"
-#include "fairino_msgs/srv/plan_motion.hpp"
-#include "fairino_msgs/srv/execute_motion.hpp"
-#include "fairino_msgs/srv/plan_and_execute.hpp"
-#include "fairino_msgs/srv/end_effector_command.hpp"
-#include "fairino_msgs/srv/cyclic_grasp.hpp"
-#include "fairino_msgs/srv/controller_command.hpp"
+using namespace std::chrono_literals;
 
-// Utility for environment variable
-std::string get_env(const char* key, const std::string& def = "") {
-    const char* val = std::getenv(key);
-    return val ? std::string(val) : def;
+// Utility: get environment variable with fallback
+std::string getenv_or(const char* key, const char* def) {
+    const char* v = std::getenv(key);
+    if (!v) return std::string(def);
+    return std::string(v);
 }
 
-// HTTP Response helpers
-std::string http_ok_json(const std::string& json) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 200 OK\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Content-Length: " << json.size() << "\r\n\r\n"
-        << json;
-    return oss.str();
-}
-
-std::string http_bad_request(const std::string& msg) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 400 Bad Request\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Content-Length: " << msg.size() << "\r\n\r\n"
-        << msg;
-    return oss.str();
-}
-
-std::string http_method_not_allowed() {
-    std::string msg = "{\"error\": \"Method Not Allowed\"}";
-    std::ostringstream oss;
-    oss << "HTTP/1.1 405 Method Not Allowed\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Content-Length: " << msg.size() << "\r\n\r\n"
-        << msg;
-    return oss.str();
-}
-
-std::string http_internal_error(const std::string& msg) {
-    std::ostringstream oss;
-    oss << "HTTP/1.1 500 Internal Server Error\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Content-Length: " << msg.size() << "\r\n\r\n"
-        << msg;
-    return oss.str();
-}
-
-std::string http_not_found() {
-    std::string msg = "{\"error\": \"Not Found\"}";
-    std::ostringstream oss;
-    oss << "HTTP/1.1 404 Not Found\r\n"
-        << "Content-Type: application/json\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Content-Length: " << msg.size() << "\r\n\r\n"
-        << msg;
-    return oss.str();
-}
-
-// HTTP Request parsing
-struct HttpRequest {
-    std::string method;
-    std::string path;
-    std::map<std::string, std::string> headers;
-    std::string body;
-};
-
-HttpRequest parse_http_request(const std::string& req) {
-    HttpRequest r;
-    std::istringstream iss(req);
-    std::string line;
-    std::getline(iss, line);
-    std::istringstream ls(line);
-    ls >> r.method;
-    ls >> r.path;
-    while (std::getline(iss, line) && line != "\r") {
-        auto pos = line.find(':');
-        if (pos != std::string::npos) {
-            auto key = line.substr(0, pos);
-            auto value = line.substr(pos + 1);
-            value.erase(0, value.find_first_not_of(" \t"));
-            value.erase(value.find_last_not_of("\r\n") + 1);
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            r.headers[key] = value;
-        }
-    }
-    // Read body if present
-    auto it = r.headers.find("content-length");
-    if (it != r.headers.end()) {
-        size_t len = std::stoi(it->second);
-        r.body.resize(len);
-        iss.read(&r.body[0], len);
-    }
-    return r;
-}
-
-// ------------ ROS2 Client Node ---------------
-class FairinoROS2Client : public rclcpp::Node {
+// --- ROS2 Node Wrapping ---
+class FairinoROS2Driver : public rclcpp::Node {
 public:
-    FairinoROS2Client(const std::string& node_name)
-        : Node(node_name)
+    FairinoROS2Driver(const std::string& node_name)
+    : Node(node_name)
     {
-        // Services
-        plan_cli_ = this->create_client<fairino_msgs::srv::PlanMotion>("plan_motion");
-        exec_cli_ = this->create_client<fairino_msgs::srv::ExecuteMotion>("execute_motion");
-        planexec_cli_ = this->create_client<fairino_msgs::srv::PlanAndExecute>("plan_and_execute");
-        eef_cli_ = this->create_client<fairino_msgs::srv::EndEffectorCommand>("end_effector_command");
-        grasp_cli_ = this->create_client<fairino_msgs::srv::CyclicGrasp>("cyclic_grasp");
-        ctrl_cli_ = this->create_client<fairino_msgs::srv::ControllerCommand>("controller_command");
-        // State subscription
-        state_sub_ = this->create_subscription<fairino_msgs::msg::RobotState>(
-            "robot_state", 10,
-            [this](const fairino_msgs::msg::RobotState::SharedPtr msg) {
-                std::lock_guard<std::mutex> lk(state_mutex_);
-                last_state_ = *msg;
-                last_state_time_ = this->now();
-            }
-        );
+        // Setup publishers and subscribers as needed
+        joint_move_pub_ = this->create_publisher<sensor_msgs::msg::JointState>("fairino/joint_move", 10);
+        ctrl_pub_ = this->create_publisher<std_msgs::msg::String>("fairino/control", 10);
+        pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>("fairino/pose_set", 10);
+        plan_pub_ = this->create_publisher<std_msgs::msg::String>("fairino/motion_plan", 10);
+        ee_pub_ = this->create_publisher<std_msgs::msg::String>("fairino/ee_cmd", 10);
+
+        // Subscriptions for status
+        joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
+            "fairino/joint_states", 10,
+            [this](sensor_msgs::msg::JointState::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(this->status_mutex_);
+                last_joint_state_ = *msg;
+            });
+
+        pose_sub_ = this->create_subscription<geometry_msgs::msg::Pose>(
+            "fairino/robot_pose", 10,
+            [this](geometry_msgs::msg::Pose::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(this->status_mutex_);
+                last_pose_ = *msg;
+            });
+
+        controller_state_sub_ = this->create_subscription<std_msgs::msg::String>(
+            "fairino/controller_state", 10,
+            [this](std_msgs::msg::String::SharedPtr msg) {
+                std::lock_guard<std::mutex> lock(this->status_mutex_);
+                last_controller_state_ = msg->data;
+            });
+
+        // Add other subscriptions as needed for full status feedback
     }
 
-    fairino_msgs::msg::RobotState get_latest_state() {
-        std::lock_guard<std::mutex> lk(state_mutex_);
-        return last_state_;
+    // --- Robot commands ---
+    void send_joint_move(const std::vector<double>& joints) {
+        sensor_msgs::msg::JointState msg;
+        msg.position = joints;
+        joint_move_pub_->publish(msg);
     }
 
-    // --- Service wrappers ---
-
-    bool plan_motion(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::PlanMotion::Request>();
-        // Populate req from json
-        if (!parse_plan_motion_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
-        }
-        if (!plan_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 plan_motion service not available\"}";
-            return false;
-        }
-        auto fut = plan_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"plan_motion service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = plan_motion_response_to_json(resp);
-        return true;
+    void send_ctrl(const std::string& ctrl) {
+        std_msgs::msg::String msg;
+        msg.data = ctrl;
+        ctrl_pub_->publish(msg);
     }
 
-    bool execute_motion(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::ExecuteMotion::Request>();
-        if (!parse_execute_motion_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
+    void send_pose(const std::vector<double>& pose) {
+        geometry_msgs::msg::Pose msg;
+        if (pose.size() >= 7) {
+            msg.position.x = pose[0];
+            msg.position.y = pose[1];
+            msg.position.z = pose[2];
+            msg.orientation.x = pose[3];
+            msg.orientation.y = pose[4];
+            msg.orientation.z = pose[5];
+            msg.orientation.w = pose[6];
         }
-        if (!exec_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 execute_motion service not available\"}";
-            return false;
-        }
-        auto fut = exec_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"execute_motion service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = execute_motion_response_to_json(resp);
-        return true;
+        pose_pub_->publish(msg);
     }
 
-    bool plan_and_execute(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::PlanAndExecute::Request>();
-        if (!parse_plan_and_execute_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
-        }
-        if (!planexec_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 plan_and_execute service not available\"}";
-            return false;
-        }
-        auto fut = planexec_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"plan_and_execute service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = plan_and_execute_response_to_json(resp);
-        return true;
+    void send_plan(const std::string& plan) {
+        std_msgs::msg::String msg;
+        msg.data = plan;
+        plan_pub_->publish(msg);
     }
 
-    bool end_effector_command(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::EndEffectorCommand::Request>();
-        if (!parse_end_effector_command_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
-        }
-        if (!eef_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 end_effector_command service not available\"}";
-            return false;
-        }
-        auto fut = eef_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"end_effector_command service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = end_effector_command_response_to_json(resp);
-        return true;
+    void send_ee_command(const std::string& ee_cmd) {
+        std_msgs::msg::String msg;
+        msg.data = ee_cmd;
+        ee_pub_->publish(msg);
     }
 
-    bool cyclic_grasp(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::CyclicGrasp::Request>();
-        if (!parse_cyclic_grasp_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
+    // --- Status retrieval ---
+    std::string get_status_json() {
+        std::lock_guard<std::mutex> lock(status_mutex_);
+        std::ostringstream oss;
+        oss << "{";
+        // Joint positions
+        oss << "\"joints\":[";
+        for (size_t i=0; i<last_joint_state_.position.size(); ++i) {
+            if (i>0) oss << ",";
+            oss << last_joint_state_.position[i];
         }
-        if (!grasp_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 cyclic_grasp service not available\"}";
-            return false;
-        }
-        auto fut = grasp_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"cyclic_grasp service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = cyclic_grasp_response_to_json(resp);
-        return true;
-    }
-
-    bool controller_command(const std::string& json, std::string& result_json) {
-        auto req = std::make_shared<fairino_msgs::srv::ControllerCommand::Request>();
-        if (!parse_controller_command_json(json, req)) {
-            result_json = "{\"error\":\"Invalid request body\"}";
-            return false;
-        }
-        if (!ctrl_cli_->wait_for_service(std::chrono::milliseconds(500))) {
-            result_json = "{\"error\":\"ROS2 controller_command service not available\"}";
-            return false;
-        }
-        auto fut = ctrl_cli_->async_send_request(req);
-        auto status = rclcpp::spin_until_future_complete(this->get_node_base_interface(), fut, std::chrono::seconds(5));
-        if (status != rclcpp::FutureReturnCode::SUCCESS) {
-            result_json = "{\"error\":\"controller_command service call failed\"}";
-            return false;
-        }
-        auto resp = fut.get();
-        result_json = controller_command_response_to_json(resp);
-        return true;
-    }
-
-    bool get_state_json(std::string& result_json) {
-        fairino_msgs::msg::RobotState state = get_latest_state();
-        result_json = robot_state_to_json(state);
-        return true;
+        oss << "]";
+        // Pose
+        oss << ",\"pose\":{";
+        oss << "\"x\":" << last_pose_.position.x << ",\"y\":" << last_pose_.position.y << ",\"z\":" << last_pose_.position.z;
+        oss << ",\"qx\":" << last_pose_.orientation.x << ",\"qy\":" << last_pose_.orientation.y << ",\"qz\":" << last_pose_.orientation.z << ",\"qw\":" << last_pose_.orientation.w;
+        oss << "}";
+        // Controller
+        oss << ",\"controller_state\":\"" << last_controller_state_ << "\"";
+        oss << "}";
+        return oss.str();
     }
 
 private:
-    // Placeholders for ROS2 clients and subs
-    rclcpp::Client<fairino_msgs::srv::PlanMotion>::SharedPtr plan_cli_;
-    rclcpp::Client<fairino_msgs::srv::ExecuteMotion>::SharedPtr exec_cli_;
-    rclcpp::Client<fairino_msgs::srv::PlanAndExecute>::SharedPtr planexec_cli_;
-    rclcpp::Client<fairino_msgs::srv::EndEffectorCommand>::SharedPtr eef_cli_;
-    rclcpp::Client<fairino_msgs::srv::CyclicGrasp>::SharedPtr grasp_cli_;
-    rclcpp::Client<fairino_msgs::srv::ControllerCommand>::SharedPtr ctrl_cli_;
-    rclcpp::Subscription<fairino_msgs::msg::RobotState>::SharedPtr state_sub_;
-    // State cache
-    fairino_msgs::msg::RobotState last_state_;
-    rclcpp::Time last_state_time_;
-    std::mutex state_mutex_;
+    // Publishers
+    rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_move_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ctrl_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr plan_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr ee_pub_;
 
-    // --- JSON parsing and generation placeholders ---
+    // Subscriptions
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Pose>::SharedPtr pose_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr controller_state_sub_;
 
-    bool parse_plan_motion_json(const std::string&, fairino_msgs::srv::PlanMotion::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string plan_motion_response_to_json(const fairino_msgs::srv::PlanMotion::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"plan_motion response\"}";
-    }
-    bool parse_execute_motion_json(const std::string&, fairino_msgs::srv::ExecuteMotion::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string execute_motion_response_to_json(const fairino_msgs::srv::ExecuteMotion::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"execute_motion response\"}";
-    }
-    bool parse_plan_and_execute_json(const std::string&, fairino_msgs::srv::PlanAndExecute::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string plan_and_execute_response_to_json(const fairino_msgs::srv::PlanAndExecute::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"plan_and_execute response\"}";
-    }
-    bool parse_end_effector_command_json(const std::string&, fairino_msgs::srv::EndEffectorCommand::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string end_effector_command_response_to_json(const fairino_msgs::srv::EndEffectorCommand::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"end_effector_command response\"}";
-    }
-    bool parse_cyclic_grasp_json(const std::string&, fairino_msgs::srv::CyclicGrasp::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string cyclic_grasp_response_to_json(const fairino_msgs::srv::CyclicGrasp::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"cyclic_grasp response\"}";
-    }
-    bool parse_controller_command_json(const std::string&, fairino_msgs::srv::ControllerCommand::Request::SharedPtr&) {
-        // TODO: Implement actual parsing
-        return true;
-    }
-    std::string controller_command_response_to_json(const fairino_msgs::srv::ControllerCommand::Response::SharedPtr&) {
-        // TODO: Implement actual serialization
-        return "{\"result\": \"controller_command response\"}";
-    }
-    std::string robot_state_to_json(const fairino_msgs::msg::RobotState&) {
-        // TODO: Implement actual serialization
-        return "{\"state\": \"robot_state data\"}";
-    }
+    // Last status (protected by mutex)
+    sensor_msgs::msg::JointState last_joint_state_;
+    geometry_msgs::msg::Pose last_pose_;
+    std::string last_controller_state_;
+    std::mutex status_mutex_;
 };
 
-// ----------- HTTP Server Implementation ---------------
+// --- HTTP Server and ROS2 Integration ---
+int main(int argc, char * argv[]) {
+    // Read config from env
+    std::string ROS_DOMAIN_ID = getenv_or("ROS_DOMAIN_ID", "0");
+    std::string SERVER_HOST = getenv_or("HTTP_SERVER_HOST", "0.0.0.0");
+    std::string SERVER_PORT = getenv_or("HTTP_SERVER_PORT", "8080");
 
-class HttpServer {
-public:
-    HttpServer(asio::io_context& io,
-               std::shared_ptr<FairinoROS2Client> ros2_client,
-               const std::string& host,
-               unsigned short port)
-        : acceptor_(io, asio::ip::tcp::endpoint(asio::ip::make_address(host), port)),
-          ros2_client_(ros2_client)
-    {
-        do_accept();
-    }
+    setenv("ROS_DOMAIN_ID", ROS_DOMAIN_ID.c_str(), 1);
 
-private:
-    asio::ip::tcp::acceptor acceptor_;
-    std::shared_ptr<FairinoROS2Client> ros2_client_;
-
-    void do_accept() {
-        acceptor_.async_accept(
-            [this](std::error_code ec, asio::ip::tcp::socket socket) {
-                if (!ec) {
-                    std::thread([this, sock = std::move(socket)]() mutable {
-                        handle_session(std::move(sock));
-                    }).detach();
-                }
-                do_accept();
-            }
-        );
-    }
-
-    void handle_session(asio::ip::tcp::socket socket) {
-        try {
-            asio::streambuf buf;
-            asio::read_until(socket, buf, "\r\n\r\n");
-            std::istream req_stream(&buf);
-            std::string req_str;
-            std::getline(req_stream, req_str, '\0');
-            HttpRequest req = parse_http_request(req_str);
-
-            std::string resp;
-            if (req.method == "GET" && req.path == "/state") {
-                std::string json;
-                if (ros2_client_->get_state_json(json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_internal_error("{\"error\":\"Failed to retrieve robot state\"}");
-                }
-            } else if (req.method == "POST" && req.path == "/plan") {
-                std::string json;
-                if (ros2_client_->plan_motion(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else if (req.method == "POST" && req.path == "/exec") {
-                std::string json;
-                if (ros2_client_->execute_motion(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else if (req.method == "POST" && req.path == "/planexec") {
-                std::string json;
-                if (ros2_client_->plan_and_execute(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else if (req.method == "POST" && req.path == "/eef") {
-                std::string json;
-                if (ros2_client_->end_effector_command(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else if (req.method == "POST" && req.path == "/grasp") {
-                std::string json;
-                if (ros2_client_->cyclic_grasp(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else if (req.method == "POST" && req.path == "/ctrl") {
-                std::string json;
-                if (ros2_client_->controller_command(req.body, json)) {
-                    resp = http_ok_json(json);
-                } else {
-                    resp = http_bad_request(json);
-                }
-            } else {
-                resp = http_not_found();
-            }
-            asio::write(socket, asio::buffer(resp));
-        } catch (const std::exception& ex) {
-            std::string resp = http_internal_error("{\"error\":\"Internal server error\"}");
-            asio::write(socket, asio::buffer(resp));
-        }
-        socket.close();
-    }
-};
-
-// ------------ Main Entrypoint ------------
-
-std::atomic<bool> running{true};
-
-void sig_handler(int) {
-    running = false;
-}
-
-int main(int argc, char* argv[]) {
-    // Read environment variables
-    std::string ros2_domain = get_env("ROS_DOMAIN_ID", "0");
-    std::string ros2_ns = get_env("ROS_NAMESPACE", "");
-    std::string http_host = get_env("FAIRINO_HTTP_HOST", "0.0.0.0");
-    unsigned short http_port = static_cast<unsigned short>(std::stoi(get_env("FAIRINO_HTTP_PORT", "8080")));
-
-    // Set up signal handling for clean exit
-    std::signal(SIGINT, sig_handler);
-    std::signal(SIGTERM, sig_handler);
-
-    // Init ROS2
+    // Start ROS2
     rclcpp::init(argc, argv);
-
-    // ROS2 node
-    auto ros2_client = std::make_shared<FairinoROS2Client>("fairino_http_driver");
-
-    // IO context for HTTP server
-    asio::io_context io;
+    auto driver_node = std::make_shared<FairinoROS2Driver>("fairino_http_driver");
 
     // HTTP server
-    HttpServer server(io, ros2_client, http_host, http_port);
+    httplib::Server svr;
 
-    // ROS2 run thread
-    std::thread ros2_thread([&]() {
-        rclcpp::spin(ros2_client);
+    // POST /move
+    svr.Post("/move", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: {"joints":[j1,j2,...,j6]}
+        try {
+            auto body = req.body;
+            size_t pos = body.find("\"joints\"");
+            if (pos == std::string::npos) { res.status=400; res.set_content("{\"error\":\"Missing joints\"}", "application/json"); return; }
+            std::vector<double> joints;
+            pos = body.find("[", pos);
+            size_t end = body.find("]", pos);
+            std::string v = body.substr(pos+1, end-pos-1);
+            std::istringstream ss(v);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                joints.push_back(std::stod(token));
+            }
+            if (joints.size() < 6) { res.status=400; res.set_content("{\"error\":\"At least 6 joints required\"}", "application/json"); return; }
+            driver_node->send_joint_move(joints);
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (...) {
+            res.status=400;
+            res.set_content("{\"error\":\"Parse error\"}", "application/json");
+        }
     });
 
-    // Main IO loop
-    while (running) {
-        io.poll();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    // PUT /ctrl
+    svr.Put("/ctrl", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: {"controller":"controller_name"}
+        try {
+            auto body = req.body;
+            size_t pos = body.find("\"controller\"");
+            if (pos == std::string::npos) { res.status=400; res.set_content("{\"error\":\"Missing controller\"}", "application/json"); return; }
+            pos = body.find(":", pos);
+            pos = body.find_first_of("\"'", pos);
+            size_t end = body.find_first_of("\"'", pos+1);
+            std::string ctrl = body.substr(pos+1, end-pos-1);
+            driver_node->send_ctrl(ctrl);
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (...) {
+            res.status=400;
+            res.set_content("{\"error\":\"Parse error\"}", "application/json");
+        }
+    });
 
+    // PUT /pose
+    svr.Put("/pose", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: {"pose":[x,y,z,qx,qy,qz,qw]}
+        try {
+            auto body = req.body;
+            size_t pos = body.find("\"pose\"");
+            if (pos == std::string::npos) { res.status=400; res.set_content("{\"error\":\"Missing pose\"}", "application/json"); return; }
+            std::vector<double> pose;
+            pos = body.find("[", pos);
+            size_t end = body.find("]", pos);
+            std::string v = body.substr(pos+1, end-pos-1);
+            std::istringstream ss(v);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                pose.push_back(std::stod(token));
+            }
+            if (pose.size() < 7) { res.status=400; res.set_content("{\"error\":\"7 values required\"}", "application/json"); return; }
+            driver_node->send_pose(pose);
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (...) {
+            res.status=400;
+            res.set_content("{\"error\":\"Parse error\"}", "application/json");
+        }
+    });
+
+    // POST /plan
+    svr.Post("/plan", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: {"plan":"plan_data"}
+        try {
+            auto body = req.body;
+            size_t pos = body.find("\"plan\"");
+            if (pos == std::string::npos) { res.status=400; res.set_content("{\"error\":\"Missing plan\"}", "application/json"); return; }
+            pos = body.find(":", pos);
+            pos = body.find_first_of("\"'", pos);
+            size_t end = body.find_first_of("\"'", pos+1);
+            std::string plan = body.substr(pos+1, end-pos-1);
+            driver_node->send_plan(plan);
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (...) {
+            res.status=400;
+            res.set_content("{\"error\":\"Parse error\"}", "application/json");
+        }
+    });
+
+    // POST /ee
+    svr.Post("/ee", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        // Expect JSON: {"ee_cmd":"open"} or similar
+        try {
+            auto body = req.body;
+            size_t pos = body.find("\"ee_cmd\"");
+            if (pos == std::string::npos) { res.status=400; res.set_content("{\"error\":\"Missing ee_cmd\"}", "application/json"); return; }
+            pos = body.find(":", pos);
+            pos = body.find_first_of("\"'", pos);
+            size_t end = body.find_first_of("\"'", pos+1);
+            std::string ee_cmd = body.substr(pos+1, end-pos-1);
+            driver_node->send_ee_command(ee_cmd);
+            res.set_content("{\"status\":\"ok\"}", "application/json");
+        } catch (...) {
+            res.status=400;
+            res.set_content("{\"error\":\"Parse error\"}", "application/json");
+        }
+    });
+
+    // GET /status
+    svr.Get("/status", [driver_node](const httplib::Request& req, httplib::Response& res) {
+        res.set_content(driver_node->get_status_json(), "application/json");
+    });
+
+    // ROS2 spin in separate thread
+    std::thread ros_thread([&](){
+        rclcpp::spin(driver_node);
+    });
+
+    std::cout << "Fairino HTTP ROS2 driver running at " << SERVER_HOST << ":" << SERVER_PORT << std::endl;
+    svr.listen(SERVER_HOST.c_str(), std::stoi(SERVER_PORT));
     rclcpp::shutdown();
-    ros2_thread.join();
+    ros_thread.join();
     return 0;
 }
