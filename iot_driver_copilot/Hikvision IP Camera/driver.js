@@ -1,145 +1,143 @@
 const http = require('http');
-const { spawn } = require('child_process');
 const url = require('url');
+const { spawn } = require('child_process');
+const { PassThrough } = require('stream');
 
-// Environment Variables
-const CAMERA_IP = process.env.CAMERA_IP;
-const CAMERA_RTSP_PORT = process.env.CAMERA_RTSP_PORT || '554';
-const CAMERA_USER = process.env.CAMERA_USER || '';
-const CAMERA_PASS = process.env.CAMERA_PASS || '';
-const CAMERA_CHANNEL = process.env.CAMERA_CHANNEL || '101';
+// Load configuration from environment variables
+const DEVICE_IP = process.env.DEVICE_IP;
+const DEVICE_RTSP_PORT = process.env.DEVICE_RTSP_PORT || '554';
+const DEVICE_RTSP_PATH = process.env.DEVICE_RTSP_PATH || 'Streaming/Channels/101';
+const DEVICE_RTSP_USER = process.env.DEVICE_RTSP_USER || '';
+const DEVICE_RTSP_PASS = process.env.DEVICE_RTSP_PASS || '';
 const SERVER_HOST = process.env.SERVER_HOST || '0.0.0.0';
-const SERVER_PORT = process.env.SERVER_PORT || '8080';
-const HTTP_STREAM_PORT = process.env.HTTP_STREAM_PORT || '8081';
+const SERVER_PORT = process.env.SERVER_PORT || 8080;
 
-if (!CAMERA_IP) {
-    throw new Error('CAMERA_IP environment variable is required');
+if (!DEVICE_IP) {
+    throw new Error("DEVICE_IP environment variable is required");
 }
 
-// RTSP URL construction
-let RTSP_AUTH = '';
-if (CAMERA_USER && CAMERA_PASS) {
-    RTSP_AUTH = `${CAMERA_USER}:${CAMERA_PASS}@`;
-}
-const RTSP_URL = `rtsp://${RTSP_AUTH}${CAMERA_IP}:${CAMERA_RTSP_PORT}/Streaming/Channels/${CAMERA_CHANNEL}`;
+const RTSP_URL =
+    'rtsp://' +
+    (DEVICE_RTSP_USER && DEVICE_RTSP_PASS
+        ? encodeURIComponent(DEVICE_RTSP_USER) + ':' + encodeURIComponent(DEVICE_RTSP_PASS) + '@'
+        : '') +
+    DEVICE_IP +
+    ':' +
+    DEVICE_RTSP_PORT +
+    '/' +
+    DEVICE_RTSP_PATH.replace(/^\//, '');
 
-// Stream state
-let ffmpegProc = null;
-let streamClients = [];
+let streamProcess = null;
+let videoStream = null;
+let clients = [];
 let isStreaming = false;
 
-// HTTP MJPEG streaming server
-const streamServer = http.createServer((req, res) => {
-    if (req.url !== '/video') {
-        res.writeHead(404, { 'Content-Type': 'text/plain' });
-        res.end('Not Found');
+// HLS Segmenter (in-memory, simple implementation)
+const hlsSegments = [];
+const HLS_SEGMENT_MAX = 5;
+const hlsM3u8Header = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n';
+
+function startStream(res = null) {
+    if (isStreaming) {
+        if (res) res.writeHead(200).end(JSON.stringify({ status: 'already streaming' }));
         return;
     }
-    res.writeHead(200, {
-        'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
-        'Connection': 'close',
-        'Pragma': 'no-cache',
-        'Cache-Control': 'no-cache',
-        'Expires': '0'
-    });
-
-    streamClients.push(res);
-
-    req.on('close', () => {
-        streamClients = streamClients.filter(c => c !== res);
-    });
-});
-streamServer.listen(HTTP_STREAM_PORT, SERVER_HOST);
-
-// Start FFmpeg process
-function startStream() {
-    if (isStreaming) return;
-    // FFmpeg args: RTSP in, MJPEG out to stdout
-    const args = [
+    // Use ffmpeg to convert RTSP to MPEG-TS (for HTTP/Browser playback)
+    streamProcess = spawn('ffmpeg', [
         '-rtsp_transport', 'tcp',
         '-i', RTSP_URL,
-        '-f', 'mjpeg',
-        '-q:v', '2',
-        '-r', '15',
+        '-f', 'mpegts',
+        '-codec:v', 'mpeg1video',
+        '-codec:a', 'mp2',
+        '-r', '25',
         '-'
-    ];
-    ffmpegProc = spawn('ffmpeg', args);
+    ]);
+    videoStream = new PassThrough();
+    streamProcess.stdout.pipe(videoStream);
 
-    ffmpegProc.stdout.on('data', (chunk) => {
-        for (const client of streamClients) {
-            client.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-            client.write(chunk);
-            client.write('\r\n');
-        }
-    });
-
-    ffmpegProc.stderr.on('data', () => { /* Silence FFmpeg logs */ });
-
-    ffmpegProc.on('close', () => {
+    streamProcess.stderr.on('data', () => {});
+    streamProcess.on('close', () => {
         isStreaming = false;
-        ffmpegProc = null;
-        for (const client of streamClients) {
-            try { client.end(); } catch {}
-        }
-        streamClients = [];
+        videoStream = null;
+        streamProcess = null;
+        clients.forEach((client) => client.end());
+        clients = [];
     });
 
     isStreaming = true;
+    if (res) res.writeHead(200).end(JSON.stringify({ status: 'stream started' }));
 }
 
-function stopStream() {
-    if (ffmpegProc) {
-        ffmpegProc.kill('SIGKILL');
-        ffmpegProc = null;
+function stopStream(res = null) {
+    if (!isStreaming) {
+        if (res) res.writeHead(200).end(JSON.stringify({ status: 'not streaming' }));
+        return;
+    }
+    if (streamProcess) {
+        streamProcess.kill('SIGTERM');
+        streamProcess = null;
+    }
+    if (videoStream) {
+        videoStream.end();
+        videoStream = null;
     }
     isStreaming = false;
+    if (res) res.writeHead(200).end(JSON.stringify({ status: 'stream stopped' }));
 }
 
-// Main API server
-const apiServer = http.createServer((req, res) => {
+function handleStream(req, res) {
+    if (!isStreaming) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Stream not started' }));
+        return;
+    }
+    res.writeHead(200, {
+        'Content-Type': 'video/mp2t',
+        'Connection': 'keep-alive',
+        'Cache-Control': 'no-cache'
+    });
+    clients.push(res);
+    videoStream.pipe(res);
+
+    req.on('close', () => {
+        const idx = clients.indexOf(res);
+        if (idx >= 0) clients.splice(idx, 1);
+        try { res.end(); } catch (_) {}
+    });
+}
+
+const requestHandler = (req, res) => {
     const parsedUrl = url.parse(req.url, true);
-
-    // POST /stream/start
     if (req.method === 'POST' && parsedUrl.pathname === '/stream/start') {
-        startStream();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-            status: 'streaming',
-            message: 'Video stream started',
-            stream_url: `http://${SERVER_HOST}:${HTTP_STREAM_PORT}/video`
-        }));
+        startStream(res);
         return;
     }
-
-    // POST /stream/stop
     if (req.method === 'POST' && parsedUrl.pathname === '/stream/stop') {
-        stopStream();
+        stopStream(res);
+        return;
+    }
+    if (req.method === 'GET' && parsedUrl.pathname === '/stream') {
+        handleStream(req, res);
+        return;
+    }
+    // Simple info endpoint
+    if (req.method === 'GET' && parsedUrl.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-            status: 'stopped',
-            message: 'Video stream stopped'
+            device: 'Hikvision IP Camera',
+            endpoints: [
+                { method: 'POST', path: '/stream/start', description: 'Start camera stream' },
+                { method: 'POST', path: '/stream/stop', description: 'Stop camera stream' },
+                { method: 'GET', path: '/stream', description: 'Get live video stream (MPEG-TS)' }
+            ]
         }));
         return;
     }
-
-    // GET /
-    if (req.method === 'GET' && parsedUrl.pathname === '/') {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(`
-            <html>
-            <body>
-                <h1>Hikvision Camera Stream</h1>
-                <img src="http://${SERVER_HOST}:${HTTP_STREAM_PORT}/video" style="max-width:100%;">
-                <form method="POST" action="/stream/start"><button type="submit">Start Stream</button></form>
-                <form method="POST" action="/stream/stop"><button type="submit">Stop Stream</button></form>
-            </body>
-            </html>
-        `);
-        return;
-    }
-
     res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Not Found' }));
-});
+    res.end(JSON.stringify({ error: 'Not found' }));
+};
 
-apiServer.listen(SERVER_PORT, SERVER_HOST);
+const server = http.createServer(requestHandler);
+server.listen(SERVER_PORT, SERVER_HOST, () => {
+    console.log(`Hikvision IP Camera driver HTTP server running at http://${SERVER_HOST}:${SERVER_PORT}/`);
+});
