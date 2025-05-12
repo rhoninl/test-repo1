@@ -1,133 +1,139 @@
 const http = require('http');
+const url = require('url');
 const { spawn } = require('child_process');
-const { parse } = require('url');
-const { PassThrough } = require('stream');
+const { Writable } = require('stream');
 
-const CAMERA_IP = process.env.CAMERA_IP;
-const CAMERA_USER = process.env.CAMERA_USER || 'admin';
-const CAMERA_PASSWORD = process.env.CAMERA_PASSWORD || '';
-const RTSP_PORT = process.env.RTSP_PORT || '554';
-const RTSP_PATH = process.env.RTSP_PATH || 'Streaming/Channels/101';
-const HTTP_HOST = process.env.HTTP_HOST || '0.0.0.0';
-const HTTP_PORT = process.env.HTTP_PORT || 8080;
+// Configuration from environment variables
+const DEVICE_IP = process.env.HIK_DEVICE_IP;
+const DEVICE_RTSP_PORT = process.env.HIK_RTSP_PORT || '554';
+const DEVICE_RTSP_USER = process.env.HIK_RTSP_USER || 'admin';
+const DEVICE_RTSP_PASS = process.env.HIK_RTSP_PASS || '';
+const DEVICE_RTSP_PATH = process.env.HIK_RTSP_PATH || 'Streaming/Channels/101';
+const SERVER_HOST = process.env.HIK_HTTP_HOST || '0.0.0.0';
+const SERVER_PORT = process.env.HIK_HTTP_PORT || 8080;
 
-// RTSP URL for Hikvision
-const RTSP_URL = `rtsp://${CAMERA_USER}:${CAMERA_PASSWORD}@${CAMERA_IP}:${RTSP_PORT}/${RTSP_PATH}`;
+// Validate required env vars
+if (!DEVICE_IP || !DEVICE_RTSP_USER || !DEVICE_RTSP_PASS) {
+    throw new Error('Missing required environment variables for Hikvision connection');
+}
 
-// Global state for stream management
+// Global state
+let streaming = false;
 let ffmpegProcess = null;
-let streamClients = [];
-let videoStream = null;
-let isStreaming = false;
+let viewers = [];
 
-// Utility: Start FFmpeg to convert RTSP to MJPEG over HTTP
+// Helper: Build RTSP URL
+function buildRtspUrl() {
+    return `rtsp://${encodeURIComponent(DEVICE_RTSP_USER)}:${encodeURIComponent(DEVICE_RTSP_PASS)}@${DEVICE_IP}:${DEVICE_RTSP_PORT}/${DEVICE_RTSP_PATH}`;
+}
+
+// Helper: Start pulling RTSP and transcode to MJPEG
 function startStream() {
-    if (isStreaming) return;
-    isStreaming = true;
+    if (streaming && ffmpegProcess) return;
 
-    videoStream = new PassThrough();
+    const rtspUrl = buildRtspUrl();
 
-    ffmpegProcess = spawn(
-        'ffmpeg',
-        [
-            '-rtsp_transport', 'tcp',
-            '-i', RTSP_URL,
-            '-f', 'mjpeg',
-            '-q:v', '5',
-            '-r', '20',
-            '-an',
-            '-'
-        ],
-        { stdio: ['ignore', 'pipe', 'ignore'] }
-    );
+    // Use ffmpeg to convert RTSP (H264/H265) to MJPEG for browser compatibility
+    ffmpegProcess = spawn('ffmpeg', [
+        '-rtsp_transport', 'tcp',
+        '-i', rtspUrl,
+        '-f', 'mjpeg',
+        '-q', '5',
+        '-r', '20',
+        '-'
+    ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+    streaming = true;
 
     ffmpegProcess.stdout.on('data', (chunk) => {
-        if (videoStream) videoStream.write(chunk);
+        // Broadcast to all connected viewers
+        viewers.forEach((res) => {
+            res.write(chunk);
+        });
     });
 
-    ffmpegProcess.on('exit', () => {
-        stopStream();
-    });
-
-    ffmpegProcess.on('error', () => {
-        stopStream();
+    ffmpegProcess.on('close', () => {
+        streaming = false;
+        ffmpegProcess = null;
+        viewers.forEach((res) => {
+            try {
+                res.end();
+            } catch (e) {}
+        });
+        viewers = [];
     });
 }
 
+// Helper: Stop pulling RTSP
 function stopStream() {
-    isStreaming = false;
-
     if (ffmpegProcess) {
-        ffmpegProcess.kill('SIGKILL');
+        ffmpegProcess.kill('SIGTERM');
         ffmpegProcess = null;
     }
-    if (videoStream) {
-        videoStream.end();
-        videoStream = null;
-    }
-    streamClients.forEach(res => {
-        try { res.end(); } catch {}
-    });
-    streamClients = [];
+    streaming = false;
 }
 
 // HTTP Server
 const server = http.createServer((req, res) => {
-    const url = parse(req.url, true);
-    // POST /stream/start
-    if (req.method === 'POST' && url.pathname === '/stream/start') {
-        startStream();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', message: 'Stream started' }));
+    const reqUrl = url.parse(req.url, true);
+
+    // Start Stream endpoint
+    if (req.method === 'POST' && reqUrl.pathname === '/stream/start') {
+        if (!streaming) {
+            startStream();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'started' }));
+        } else {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ status: 'already_streaming' }));
+        }
         return;
     }
-    // POST /stream/stop
-    if (req.method === 'POST' && url.pathname === '/stream/stop') {
+
+    // Stop Stream endpoint
+    if (req.method === 'POST' && reqUrl.pathname === '/stream/stop') {
         stopStream();
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', message: 'Stream stopped' }));
+        res.end(JSON.stringify({ status: 'stopped' }));
         return;
     }
-    // GET /stream
-    if (req.method === 'GET' && url.pathname === '/stream') {
-        if (!isStreaming) {
+
+    // Video Stream endpoint (HTTP MJPEG)
+    if (req.method === 'GET' && reqUrl.pathname === '/stream') {
+        if (!streaming) {
             res.writeHead(503, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ error: 'Stream not started. POST /stream/start first.' }));
             return;
         }
         res.writeHead(200, {
             'Content-Type': 'multipart/x-mixed-replace; boundary=ffserver',
-            'Connection': 'close',
-            'Pragma': 'no-cache',
             'Cache-Control': 'no-cache',
+            'Connection': 'close',
+            'Pragma': 'no-cache'
         });
-        streamClients.push(res);
-
-        const onData = (chunk) => {
-            try {
-                res.write(`--ffserver\r\nContent-Type: image/jpeg\r\nContent-Length: ${chunk.length}\r\n\r\n`);
-                res.write(chunk);
-            } catch (e) {}
-        };
-
-        videoStream.on('data', onData);
+        viewers.push(res);
 
         req.on('close', () => {
-            videoStream.removeListener('data', onData);
-            streamClients = streamClients.filter(c => c !== res);
+            viewers = viewers.filter(r => r !== res);
         });
         return;
     }
-    // 404 Not Found
+
+    // Not found
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => { stopStream(); process.exit(); });
-process.on('SIGTERM', () => { stopStream(); process.exit(); });
+process.on('SIGINT', () => {
+    stopStream();
+    process.exit();
+});
 
-// Start server
-server.listen(HTTP_PORT, HTTP_HOST, () => {
-    // No output as per requirements
+server.listen(SERVER_PORT, SERVER_HOST, () => {
+    console.log(`Hikvision HTTP video driver running at http://${SERVER_HOST}:${SERVER_PORT}/`);
+    console.log('API:');
+    console.log('  POST /stream/start  - Start video streaming');
+    console.log('  POST /stream/stop   - Stop video streaming');
+    console.log('  GET  /stream        - HTTP MJPEG video stream');
 });
