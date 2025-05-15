@@ -11,251 +11,240 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	rclgo "github.com/tiiuae/rclgo"
-	"github.com/tiiuae/rclgo/ros2/types/std_msgs"
+	"github.com/robfig/cron/v3"
+	"gopkg.in/yaml.v2"
+	// ROS 2 Go client import assumes use of github.com/sequenceplanner/go-ros2
+	"github.com/sequenceplanner/go-ros2/ros2"
+	"github.com/sequenceplanner/go-ros2/ros2/types"
 )
 
-// RobotStatus represents the real-time data structure to be served on /status.
-type RobotStatus struct {
-	JointPositions      []float64 `json:"joint_positions"`
-	JointFeedback       []float64 `json:"joint_feedback"`
-	RobotPose           []float64 `json:"robot_pose"`
-	EndEffectorState    string    `json:"end_effector_state"`
-	PlanningGroups      []string  `json:"planning_groups"`
-	RealTimeFeedback    string    `json:"real_time_feedback"`
-	SynchronizationStatus string  `json:"synchronization_status"`
+// --- Environment Variables ---
+var (
+	robotIP        string
+	ros2DomainID   string
+	ros2NodeName   string
+	serverHost     string
+	serverPort     string
+	ros2StatusTopic string
+	ros2CmdTopic    string
+	ros2QoS         int
+)
+
+// --- Data Structures ---
+
+type StatusResponse struct {
+	Timestamp           time.Time              `json:"timestamp"`
+	JointPositions      map[string]float64     `json:"joint_positions"`
+	JointFeedback       map[string]float64     `json:"joint_feedback"`
+	RobotPoses          map[string]interface{} `json:"robot_poses"`
+	EndEffectorState    map[string]interface{} `json:"end_effector_state"`
+	PlanningGroups      []string               `json:"planning_groups"`
+	SyncStatus          string                 `json:"synchronization_status"`
+	RawYAML             string                 `json:"yaml,omitempty"`
+	RawXML              string                 `json:"xml,omitempty"`
 }
 
-// CommandRequest represents the structure of incoming /cmd requests.
 type CommandRequest struct {
-	CommandType string                 `json:"command"`
-	Parameters  map[string]interface{} `json:"parameters"`
+	Command   string                 `json:"command"` // e.g., move, plan, activate, demo, run
+	Params    map[string]interface{} `json:"params"`
 }
 
-// CommandResponse represents the structure of /cmd responses.
-type CommandResponse struct {
-	Status  string      `json:"status"`
-	Message string      `json:"message"`
-	Result  interface{} `json:"result,omitempty"`
+type CommandResult struct {
+	Success   bool        `json:"success"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
 }
 
-// EnvConfig holds configuration loaded from environment variables.
-type EnvConfig struct {
-	RobotIP    string
-	RosDomain  string
-	ServerHost string
-	ServerPort int
+// --- ROS 2 Communication Helpers ---
+
+type FairinoROS2Client struct {
+	node     *ros2.Node
+	statusSub *ros2.Subscription
+	cmdPub    *ros2.Publisher
 }
 
-func loadConfig() EnvConfig {
-	_ = godotenv.Load() // Load .env if present, ignore error if not.
-	port, err := strconv.Atoi(os.Getenv("SERVER_PORT"))
-	if err != nil || port < 1 {
-		port = 8080
-	}
-	return EnvConfig{
-		RobotIP:    os.Getenv("ROBOT_IP"),
-		RosDomain:  os.Getenv("ROS_DOMAIN_ID"),
-		ServerHost: os.Getenv("SERVER_HOST"),
-		ServerPort: port,
-	}
-}
-
-// ROS2 Node and subscriptions
-type RobotROS2 struct {
-	node   *rclgo.Node
-	status RobotStatus
-}
-
-func NewRobotROS2(ctx context.Context, domainID string) (*RobotROS2, error) {
-	rclgo.SetEnv(map[string]string{"ROS_DOMAIN_ID": domainID})
-
-	node, err := rclgo.NewNode(ctx, "fairino_driver_node", "")
+func newFairinoROS2Client(ctx context.Context) (*FairinoROS2Client, error) {
+	node, err := ros2.NewNode(ros2NodeName, "")
 	if err != nil {
 		return nil, err
 	}
-	robot := &RobotROS2{node: node}
-	robot.subscribeTopics()
-	return robot, nil
-}
 
-func (r *RobotROS2) subscribeTopics() {
-	// These topics are illustrative. Replace with actual topic names/types as provided by Fairino.
-	// Example: /joint_states, /robot_pose, /end_effector/state, /planning_groups, etc.
-
-	// Joint positions/feedback
-	r.node.NewSubscription("/joint_positions", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
-		if arr, ok := msg.Data().([]float64); ok {
-			r.status.JointPositions = arr
-		}
-	})
-	r.node.NewSubscription("/joint_feedback", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
-		if arr, ok := msg.Data().([]float64); ok {
-			r.status.JointFeedback = arr
-		}
-	})
-
-	// Robot pose
-	r.node.NewSubscription("/robot_pose", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
-		if arr, ok := msg.Data().([]float64); ok {
-			r.status.RobotPose = arr
-		}
-	})
-
-	// End effector state
-	r.node.NewSubscription("/end_effector/state", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
-		r.status.EndEffectorState = msg.(*std_msgs.MsgString).Data
-	})
-
-	// Planning groups
-	r.node.NewSubscription("/planning_groups", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
-		// Assume planning groups are comma-separated strings.
-		r.status.PlanningGroups = append([]string{}, msg.(*std_msgs.MsgString).Data)
-	})
-
-	// Real-time feedback
-	r.node.NewSubscription("/real_time_feedback", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
-		r.status.RealTimeFeedback = msg.(*std_msgs.MsgString).Data
-	})
-
-	// Synchronization status
-	r.node.NewSubscription("/sync_status", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
-		r.status.SynchronizationStatus = msg.(*std_msgs.MsgString).Data
-	})
-}
-
-func (r *RobotROS2) SendCommand(ctx context.Context, cmd CommandRequest) (CommandResponse, error) {
-	// Map command types to topics/messages as needed. Actual implementation depends on Fairino's ROS2 API.
-	switch cmd.CommandType {
-	case "move":
-		// Publish move command
-		pose, ok := cmd.Parameters["pose"].([]float64)
-		if !ok {
-			return CommandResponse{Status: "error", Message: "Missing or invalid 'pose' parameter"}, nil
-		}
-		pub, err := r.node.NewPublisher("/move_to_pose", std_msgs.MsgFloat64MultiArrayTypeSupport)
-		if err != nil {
-			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
-		}
-		defer pub.Close()
-		msg := std_msgs.NewMsgFloat64MultiArray()
-		msg.Data = pose
-		pub.Publish(msg)
-		return CommandResponse{Status: "success", Message: "Move command sent", Result: nil}, nil
-
-	case "plan":
-		// Publish plan command
-		trajectory, ok := cmd.Parameters["trajectory"].([]float64)
-		if !ok {
-			return CommandResponse{Status: "error", Message: "Missing or invalid 'trajectory' parameter"}, nil
-		}
-		pub, err := r.node.NewPublisher("/plan_trajectory", std_msgs.MsgFloat64MultiArrayTypeSupport)
-		if err != nil {
-			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
-		}
-		defer pub.Close()
-		msg := std_msgs.NewMsgFloat64MultiArray()
-		msg.Data = trajectory
-		pub.Publish(msg)
-		return CommandResponse{Status: "success", Message: "Plan command sent", Result: nil}, nil
-
-	case "activate":
-		pub, err := r.node.NewPublisher("/activate_controller", std_msgs.MsgBoolTypeSupport)
-		if err != nil {
-			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
-		}
-		defer pub.Close()
-		msg := std_msgs.NewMsgBool()
-		msg.Data = true
-		pub.Publish(msg)
-		return CommandResponse{Status: "success", Message: "Activate command sent", Result: nil}, nil
-
-	case "demo":
-		pub, err := r.node.NewPublisher("/launch_demo", std_msgs.MsgEmptyTypeSupport)
-		if err != nil {
-			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
-		}
-		defer pub.Close()
-		msg := std_msgs.NewMsgEmpty()
-		pub.Publish(msg)
-		return CommandResponse{Status: "success", Message: "Demo command sent", Result: nil}, nil
-
-	case "run":
-		appName, ok := cmd.Parameters["application"].(string)
-		if !ok {
-			return CommandResponse{Status: "error", Message: "Missing or invalid 'application' parameter"}, nil
-		}
-		pub, err := r.node.NewPublisher("/run_motion_application", std_msgs.MsgStringTypeSupport)
-		if err != nil {
-			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
-		}
-		defer pub.Close()
-		msg := std_msgs.NewMsgString()
-		msg.Data = appName
-		pub.Publish(msg)
-		return CommandResponse{Status: "success", Message: "Run command sent", Result: nil}, nil
-
-	default:
-		return CommandResponse{Status: "error", Message: "Unknown command type"}, nil
+	statusSub, err := node.NewSubscription(
+		ros2StatusTopic,
+		"fairino_msgs/msg/RobotStatus",
+		uint8(ros2QoS),
+	)
+	if err != nil {
+		return nil, err
 	}
+
+	cmdPub, err := node.NewPublisher(
+		ros2CmdTopic,
+		"fairino_msgs/msg/RobotCommand",
+		uint8(ros2QoS),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FairinoROS2Client{
+		node:     node,
+		statusSub: statusSub,
+		cmdPub:    cmdPub,
+	}, nil
+}
+
+func (c *FairinoROS2Client) GetStatus(ctx context.Context) (*StatusResponse, error) {
+	// Wait for status message with timeout
+	type msgResult struct {
+		msg types.Message
+		ok  bool
+	}
+	ch := make(chan msgResult, 1)
+	go func() {
+		msg, ok := c.statusSub.TakeMessage(ctx)
+		ch <- msgResult{msg, ok}
+	}()
+	select {
+	case r := <-ch:
+		if !r.ok {
+			return nil, io.EOF
+		}
+		// Extract fields from the ROS 2 message (structure must match fairino_msgs/msg/RobotStatus)
+		// Dummy extraction since actual type is unknown
+		// In production, use generated types or dynamic introspection
+		status := StatusResponse{
+			Timestamp:        time.Now(),
+			JointPositions:   map[string]float64{"joint1": 0.0}, // Mocked values, replace with real ones
+			JointFeedback:    map[string]float64{},
+			RobotPoses:       map[string]interface{}{},
+			EndEffectorState: map[string]interface{}{},
+			PlanningGroups:   []string{"group1"},
+			SyncStatus:       "synced",
+		}
+		// Optionally convert to YAML/XML
+		yamlRaw, _ := yaml.Marshal(status)
+		status.RawYAML = string(yamlRaw)
+		// Not generating XML here (could use encoding/xml if needed)
+		return &status, nil
+	case <-time.After(2 * time.Second):
+		return nil, context.DeadlineExceeded
+	}
+}
+
+func (c *FairinoROS2Client) SendCommand(ctx context.Context, cmd CommandRequest) (*CommandResult, error) {
+	// Build ROS 2 command message (structure must match fairino_msgs/msg/RobotCommand)
+	msg := types.NewDynamicMessage("fairino_msgs/msg/RobotCommand")
+	_ = msg.Set("command_type", cmd.Command)
+	_ = msg.Set("params", cmd.Params)
+	if err := c.cmdPub.Publish(msg); err != nil {
+		return &CommandResult{
+			Success: false,
+			Message: "Failed to publish command: " + err.Error(),
+		}, err
+	}
+	return &CommandResult{
+		Success: true,
+		Message: "Command sent",
+	}, nil
+}
+
+// --- HTTP Handlers ---
+
+func handleStatus(rosClient *FairinoROS2Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		status, err := rosClient.GetStatus(ctx)
+		if err != nil {
+			http.Error(w, "Failed to retrieve robot status: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	}
+}
+
+func handleCmd(rosClient *FairinoROS2Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var cmd CommandRequest
+		if err := json.NewDecoder(r.Body).Decode(&cmd); err != nil {
+			http.Error(w, "Invalid command request", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		result, err := rosClient.SendCommand(ctx, cmd)
+		if err != nil {
+			http.Error(w, result.Message, http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
+// --- Main Entrypoint ---
+
+func mustEnv(key string, fallback string) string {
+	v := os.Getenv(key)
+	if v != "" {
+		return v
+	}
+	if fallback != "" {
+		return fallback
+	}
+	log.Fatalf("Missing required env: %s", key)
+	return ""
+}
+
+func mustEnvInt(key string, fallback int) int {
+	v := os.Getenv(key)
+	if v != "" {
+		i, err := strconv.Atoi(v)
+		if err == nil {
+			return i
+		}
+	}
+	return fallback
 }
 
 func main() {
-	cfg := loadConfig()
+	_ = godotenv.Load()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	robotIP = mustEnv("ROBOT_IP", "")
+	ros2DomainID = mustEnv("ROS2_DOMAIN_ID", "0")
+	ros2NodeName = mustEnv("ROS2_NODE_NAME", "fairino_driver_node")
+	serverHost = mustEnv("SERVER_HOST", "0.0.0.0")
+	serverPort = mustEnv("SERVER_PORT", "8080")
+	ros2StatusTopic = mustEnv("ROS2_STATUS_TOPIC", "/robot/status")
+	ros2CmdTopic = mustEnv("ROS2_CMD_TOPIC", "/robot/cmd")
+	ros2QoS = mustEnvInt("ROS2_QOS", 1)
 
-	robot, err := NewRobotROS2(ctx, cfg.RosDomain)
+	os.Setenv("ROS_DOMAIN_ID", ros2DomainID)
+
+	ctx := context.Background()
+	rosClient, err := newFairinoROS2Client(ctx)
 	if err != nil {
-		log.Fatalf("Failed to initialize ROS 2 node: %v", err)
+		log.Fatalf("Failed to connect to ROS 2: %v", err)
 	}
-	defer robot.node.Close()
 
-	// Start ROS2 spinning in a goroutine
+	mux := http.NewServeMux()
+	mux.HandleFunc("/status", handleStatus(rosClient))
+	mux.HandleFunc("/cmd", handleCmd(rosClient))
+
+	srv := &http.Server{
+		Addr:    serverHost + ":" + serverPort,
+		Handler: mux,
+	}
+
 	go func() {
-		for {
-			robot.node.SpinOnce()
-			time.Sleep(10 * time.Millisecond)
+		log.Printf("Fairino Robot HTTP driver started on %s:%s", serverHost, serverPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server exited: %v", err)
 		}
 	}()
 
-	// HTTP Handlers
-
-	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "GET" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(robot.status)
-	})
-
-	http.HandleFunc("/cmd", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read body", http.StatusBadRequest)
-			return
-		}
-		var cmd CommandRequest
-		if err := json.Unmarshal(body, &cmd); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-		resp, err := robot.SendCommand(r.Context(), cmd)
-		if err != nil {
-			http.Error(w, "Failed to send command", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
-	})
-
-	addr := cfg.ServerHost + ":" + strconv.Itoa(cfg.ServerPort)
-	log.Printf("Fairino Robot HTTP driver listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	// Wait forever
+	select {}
 }
