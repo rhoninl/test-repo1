@@ -1,149 +1,155 @@
 import os
 import asyncio
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-from io import BytesIO
+from typing import Dict, Any
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+import uvicorn
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Bool
 from sensor_msgs.msg import JointState
+from fairino_msgs.srv import SetEnable, JointMove
 
-# Environment Variables
-ROBOT_HOST = os.environ.get('ROBOT_HOST', 'localhost')
-ROBOT_ROS2_DOMAIN_ID = int(os.environ.get('ROBOT_ROS2_DOMAIN_ID', '0'))
-HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
-HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+# Environment variables for configuration
+ROS_DOMAIN_ID = int(os.getenv("ROS_DOMAIN_ID", "0"))
+ROS2_NODE_NAME = os.getenv("ROS2_NODE_NAME", "fairino_http_bridge")
+ROS2_NAMESPACE = os.getenv("ROS2_NAMESPACE", "")
+DEVICE_IP = os.getenv("DEVICE_IP", "localhost")  # Not strictly used for ROS2, but kept for compatibility
+HTTP_HOST = os.getenv("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.getenv("HTTP_PORT", "8080"))
 
-# ROS2 Node Implementation
-class FairinoROS2Node(Node):
-    def __init__(self):
-        super().__init__('fairino_http_bridge')
-        self.latest_joint_state = None
-        self.latest_robot_state = None
-        self.latest_robot_pose = None
-        
-        # Subscriptions
-        self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
-        self.create_subscription(String, '/robot_state', self.robot_state_callback, 10)
-        self.create_subscription(String, '/robot_pose', self.robot_pose_callback, 10)
-        
-        # Publishers
-        self.grasp_pub = self.create_publisher(String, '/grasp_command', 10)
-        self.move_pub = self.create_publisher(String, '/move_command', 10)
-    
-    def joint_state_callback(self, msg):
-        self.latest_joint_state = msg
-    
-    def robot_state_callback(self, msg):
-        self.latest_robot_state = msg.data
-    
-    def robot_pose_callback(self, msg):
-        self.latest_robot_pose = msg.data
-    
-    def publish_grasp(self, command):
-        msg = String()
-        msg.data = command
-        self.grasp_pub.publish(msg)
-    
-    def publish_move(self, command):
-        msg = String()
-        msg.data = command
-        self.move_pub.publish(msg)
-    
-    def get_state(self):
-        # Compose robot state data
-        return {
-            "joint_positions": {
-                "names": self.latest_joint_state.name if self.latest_joint_state else [],
-                "positions": self.latest_joint_state.position if self.latest_joint_state else [],
-                "velocities": self.latest_joint_state.velocity if self.latest_joint_state else [],
-                "effort": self.latest_joint_state.effort if self.latest_joint_state else []
-            },
-            "robot_state": json.loads(self.latest_robot_state) if self.latest_robot_state else {},
-            "robot_pose": json.loads(self.latest_robot_pose) if self.latest_robot_pose else {}
+# ROS2 client node in asyncio context
+class FairinoBridgeNode(Node):
+    def __init__(self, node_name: str, namespace: str):
+        super().__init__(node_name, namespace=namespace)
+        self.state = {
+            "joint_names": [],
+            "positions": [],
+            "velocities": [],
+            "efforts": [],
+            "timestamp": None
         }
+        self.status = {}
+        self._joint_state_event = asyncio.Event()
+        self._status_event = asyncio.Event()
 
+        self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
 
-# HTTP Server Implementation
-class FairinoHTTPRequestHandler(BaseHTTPRequestHandler):
-    ros2_node = None
+        # Service clients
+        self.enable_cli = self.create_client(SetEnable, "/robot/set_enable")
+        self.move_cli = self.create_client(JointMove, "/robot/joint_move")
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == '/state':
-            # Gather state from ROS2 node
-            state = self.ros2_node.get_state()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps(state).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'Not Found')
+    def joint_state_callback(self, msg: JointState):
+        self.state = {
+            "joint_names": list(msg.name),
+            "positions": list(msg.position),
+            "velocities": list(msg.velocity),
+            "efforts": list(msg.effort),
+            "timestamp": msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        }
+        self._joint_state_event.set()
 
-    def do_POST(self):
-        parsed = urlparse(self.path)
-        content_length = int(self.headers.get('Content-Length', 0))
-        body = self.rfile.read(content_length)
+    async def wait_for_joint_states(self, timeout=2.0):
         try:
-            data = json.loads(body.decode('utf-8')) if body else {}
-        except Exception:
-            data = {}
+            await asyncio.wait_for(self._joint_state_event.wait(), timeout)
+            self._joint_state_event.clear()
+            return self.state
+        except asyncio.TimeoutError:
+            raise TimeoutError("Timeout waiting for joint states")
 
-        if parsed.path == '/grasp':
-            # Accept grasp command and publish to ROS2 topic
-            command = data.get('command', '')
-            if command:
-                self.ros2_node.publish_grasp(command)
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "msg": "Grasp command sent"}).encode('utf-8'))
-            else:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'Missing command')
-        elif parsed.path == '/move':
-            # Accept move command and publish to ROS2 topic
-            command = data.get('command', '')
-            if command:
-                self.ros2_node.publish_move(command)
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.end_headers()
-                self.wfile.write(json.dumps({"status": "ok", "msg": "Move command sent"}).encode('utf-8'))
-            else:
-                self.send_response(400)
-                self.end_headers()
-                self.wfile.write(b'Missing command')
+    async def set_power(self, enable: bool):
+        await self.enable_cli.wait_for_service(timeout_sec=2.0)
+        req = SetEnable.Request()
+        req.enable = enable
+        future = self.enable_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        if future.result() is not None and future.result().success:
+            return {"result": "ok"}
         else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'Not Found')
+            msg = getattr(future.result(), "message", "Unknown error")
+            raise RuntimeError(f"Failed to set power: {msg}")
 
-def run_http_server(ros2_node):
-    FairinoHTTPRequestHandler.ros2_node = ros2_node
-    server = HTTPServer((HTTP_SERVER_HOST, HTTP_SERVER_PORT), FairinoHTTPRequestHandler)
-    print(f'Fairino HTTP Driver listening on {HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}')
-    server.serve_forever()
+    async def move(self, move_data: Dict[str, Any]):
+        await self.move_cli.wait_for_service(timeout_sec=2.0)
+        req = JointMove.Request()
+        # move_data must contain 'positions', optionally 'velocities', 'accelerations', 'duration'
+        req.positions = move_data.get("positions", [])
+        req.velocities = move_data.get("velocities", [])
+        req.accelerations = move_data.get("accelerations", [])
+        req.duration = float(move_data.get("duration", 0.0))
+        future = self.move_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        if future.result() is not None and future.result().success:
+            return {"result": "ok"}
+        else:
+            msg = getattr(future.result(), "message", "Unknown error")
+            raise RuntimeError(f"Failed to execute move: {msg}")
 
-def main():
-    os.environ['ROS_DOMAIN_ID'] = str(ROBOT_ROS2_DOMAIN_ID)
-    rclpy.init()
-    ros2_node = FairinoROS2Node()
+# Singleton ROS2 node for FastAPI
+class ROS2Manager:
+    _node = None
+
+    @classmethod
+    def get_node(cls):
+        if cls._node is None:
+            rclpy.init(args=None, domain_id=ROS_DOMAIN_ID)
+            cls._node = FairinoBridgeNode(
+                ROS2_NODE_NAME,
+                ROS2_NAMESPACE
+            )
+        return cls._node
+
+    @classmethod
+    def shutdown(cls):
+        if cls._node is not None:
+            cls._node.destroy_node()
+            rclpy.shutdown()
+            cls._node = None
+
+app = FastAPI()
+
+@app.get("/state")
+async def get_state():
+    node = ROS2Manager.get_node()
     try:
-        import threading
-        t = threading.Thread(target=run_http_server, args=(ros2_node,), daemon=True)
-        t.start()
-        rclpy.spin(ros2_node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        ros2_node.destroy_node()
-        rclpy.shutdown()
+        state = await node.wait_for_joint_states(timeout=2.0)
+        return JSONResponse(content={"status": "ok", "state": state})
+    except Exception as e:
+        raise HTTPException(status_code=504, detail=str(e))
 
-if __name__ == '__main__':
-    main()
+@app.post("/power")
+async def set_power(request: Request):
+    node = ROS2Manager.get_node()
+    try:
+        data = await request.json()
+        enable = data.get("enable")
+        if enable is None or not isinstance(enable, bool):
+            raise HTTPException(status_code=400, detail="Payload must contain boolean 'enable' field.")
+        result = await node.set_power(enable)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/move")
+async def move(request: Request):
+    node = ROS2Manager.get_node()
+    try:
+        move_data = await request.json()
+        if not isinstance(move_data, dict):
+            raise HTTPException(status_code=400, detail="Payload must be a valid JSON object.")
+        positions = move_data.get("positions")
+        if positions is None or not isinstance(positions, list):
+            raise HTTPException(status_code=400, detail="Payload must include 'positions' list.")
+        result = await node.move(move_data)
+        return JSONResponse(content=result)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.on_event("shutdown")
+def on_shutdown():
+    ROS2Manager.shutdown()
+
+if __name__ == "__main__":
+    uvicorn.run(app, host=HTTP_HOST, port=HTTP_PORT)
