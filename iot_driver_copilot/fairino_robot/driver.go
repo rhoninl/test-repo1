@@ -1,245 +1,261 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
 
 	"github.com/joho/godotenv"
-	"github.com/rs/cors"
-	"golang.org/x/sync/semaphore"
-	"gopkg.in/yaml.v3"
-
-	// ROS 2 Go Client
-	rclgo "github.com/sequenceplanner/rclgo"
-	"github.com/sequenceplanner/rclgo/pkg/rclgo/ros2/types/std_msgs"
+	rclgo "github.com/tiiuae/rclgo"
+	"github.com/tiiuae/rclgo/ros2/types/std_msgs"
 )
 
-type StatusResponse struct {
-	JointPositions      map[string]float64 `json:"joint_positions"`
-	JointFeedback       map[string]float64 `json:"joint_feedback"`
-	RobotPoses          map[string]float64 `json:"robot_poses"`
-	EndEffectorState    map[string]float64 `json:"end_effector_state"`
-	PlanningGroups      []string           `json:"planning_groups"`
-	RealTimeFeedback    map[string]float64 `json:"real_time_feedback"`
-	Synchronization     string             `json:"synchronization_status"`
+// RobotStatus represents the real-time data structure to be served on /status.
+type RobotStatus struct {
+	JointPositions      []float64 `json:"joint_positions"`
+	JointFeedback       []float64 `json:"joint_feedback"`
+	RobotPose           []float64 `json:"robot_pose"`
+	EndEffectorState    string    `json:"end_effector_state"`
+	PlanningGroups      []string  `json:"planning_groups"`
+	RealTimeFeedback    string    `json:"real_time_feedback"`
+	SynchronizationStatus string  `json:"synchronization_status"`
 }
 
+// CommandRequest represents the structure of incoming /cmd requests.
 type CommandRequest struct {
-	Command  string                 `json:"command" yaml:"command"`
-	Params   map[string]interface{} `json:"params" yaml:"params"`
+	CommandType string                 `json:"command"`
+	Parameters  map[string]interface{} `json:"parameters"`
 }
 
+// CommandResponse represents the structure of /cmd responses.
 type CommandResponse struct {
 	Status  string      `json:"status"`
-	Message string      `json:"message,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
+	Message string      `json:"message"`
+	Result  interface{} `json:"result,omitempty"`
 }
 
-var (
-	deviceIP       string
-	ros2DomainID   int
-	serverHost     string
-	serverPort     string
-	ros2NodeName   string
-	ros2StatusTopic string
-	ros2CommandTopic string
-	readTimeout    time.Duration
-	writeTimeout   time.Duration
-	sem            = semaphore.NewWeighted(1)
-)
+// EnvConfig holds configuration loaded from environment variables.
+type EnvConfig struct {
+	RobotIP    string
+	RosDomain  string
+	ServerHost string
+	ServerPort int
+}
 
-func getEnv(key, fallback string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
+func loadConfig() EnvConfig {
+	_ = godotenv.Load() // Load .env if present, ignore error if not.
+	port, err := strconv.Atoi(os.Getenv("SERVER_PORT"))
+	if err != nil || port < 1 {
+		port = 8080
 	}
-	return v
+	return EnvConfig{
+		RobotIP:    os.Getenv("ROBOT_IP"),
+		RosDomain:  os.Getenv("ROS_DOMAIN_ID"),
+		ServerHost: os.Getenv("SERVER_HOST"),
+		ServerPort: port,
+	}
 }
 
-func parseEnv() error {
-	deviceIP = getEnv("FAIRINO_ROBOT_IP", "127.0.0.1")
-	serverHost = getEnv("HTTP_SERVER_HOST", "0.0.0.0")
-	serverPort = getEnv("HTTP_SERVER_PORT", "8080")
-	ros2DomainID, _ = strconv.Atoi(getEnv("ROS2_DOMAIN_ID", "0"))
-	ros2NodeName = getEnv("ROS2_NODE_NAME", "fairino_http_bridge")
-	ros2StatusTopic = getEnv("ROS2_STATUS_TOPIC", "/robot/status")
-	ros2CommandTopic = getEnv("ROS2_COMMAND_TOPIC", "/robot/command")
-	readTimeoutSec, _ := strconv.Atoi(getEnv("HTTP_READ_TIMEOUT", "10"))
-	writeTimeoutSec, _ := strconv.Atoi(getEnv("HTTP_WRITE_TIMEOUT", "10"))
-	readTimeout = time.Duration(readTimeoutSec) * time.Second
-	writeTimeout = time.Duration(writeTimeoutSec) * time.Second
-	return nil
+// ROS2 Node and subscriptions
+type RobotROS2 struct {
+	node   *rclgo.Node
+	status RobotStatus
+}
+
+func NewRobotROS2(ctx context.Context, domainID string) (*RobotROS2, error) {
+	rclgo.SetEnv(map[string]string{"ROS_DOMAIN_ID": domainID})
+
+	node, err := rclgo.NewNode(ctx, "fairino_driver_node", "")
+	if err != nil {
+		return nil, err
+	}
+	robot := &RobotROS2{node: node}
+	robot.subscribeTopics()
+	return robot, nil
+}
+
+func (r *RobotROS2) subscribeTopics() {
+	// These topics are illustrative. Replace with actual topic names/types as provided by Fairino.
+	// Example: /joint_states, /robot_pose, /end_effector/state, /planning_groups, etc.
+
+	// Joint positions/feedback
+	r.node.NewSubscription("/joint_positions", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
+		if arr, ok := msg.Data().([]float64); ok {
+			r.status.JointPositions = arr
+		}
+	})
+	r.node.NewSubscription("/joint_feedback", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
+		if arr, ok := msg.Data().([]float64); ok {
+			r.status.JointFeedback = arr
+		}
+	})
+
+	// Robot pose
+	r.node.NewSubscription("/robot_pose", std_msgs.MsgFloat64MultiArrayTypeSupport, func(msg *rclgo.Msg) {
+		if arr, ok := msg.Data().([]float64); ok {
+			r.status.RobotPose = arr
+		}
+	})
+
+	// End effector state
+	r.node.NewSubscription("/end_effector/state", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
+		r.status.EndEffectorState = msg.(*std_msgs.MsgString).Data
+	})
+
+	// Planning groups
+	r.node.NewSubscription("/planning_groups", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
+		// Assume planning groups are comma-separated strings.
+		r.status.PlanningGroups = append([]string{}, msg.(*std_msgs.MsgString).Data)
+	})
+
+	// Real-time feedback
+	r.node.NewSubscription("/real_time_feedback", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
+		r.status.RealTimeFeedback = msg.(*std_msgs.MsgString).Data
+	})
+
+	// Synchronization status
+	r.node.NewSubscription("/sync_status", std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
+		r.status.SynchronizationStatus = msg.(*std_msgs.MsgString).Data
+	})
+}
+
+func (r *RobotROS2) SendCommand(ctx context.Context, cmd CommandRequest) (CommandResponse, error) {
+	// Map command types to topics/messages as needed. Actual implementation depends on Fairino's ROS2 API.
+	switch cmd.CommandType {
+	case "move":
+		// Publish move command
+		pose, ok := cmd.Parameters["pose"].([]float64)
+		if !ok {
+			return CommandResponse{Status: "error", Message: "Missing or invalid 'pose' parameter"}, nil
+		}
+		pub, err := r.node.NewPublisher("/move_to_pose", std_msgs.MsgFloat64MultiArrayTypeSupport)
+		if err != nil {
+			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
+		}
+		defer pub.Close()
+		msg := std_msgs.NewMsgFloat64MultiArray()
+		msg.Data = pose
+		pub.Publish(msg)
+		return CommandResponse{Status: "success", Message: "Move command sent", Result: nil}, nil
+
+	case "plan":
+		// Publish plan command
+		trajectory, ok := cmd.Parameters["trajectory"].([]float64)
+		if !ok {
+			return CommandResponse{Status: "error", Message: "Missing or invalid 'trajectory' parameter"}, nil
+		}
+		pub, err := r.node.NewPublisher("/plan_trajectory", std_msgs.MsgFloat64MultiArrayTypeSupport)
+		if err != nil {
+			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
+		}
+		defer pub.Close()
+		msg := std_msgs.NewMsgFloat64MultiArray()
+		msg.Data = trajectory
+		pub.Publish(msg)
+		return CommandResponse{Status: "success", Message: "Plan command sent", Result: nil}, nil
+
+	case "activate":
+		pub, err := r.node.NewPublisher("/activate_controller", std_msgs.MsgBoolTypeSupport)
+		if err != nil {
+			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
+		}
+		defer pub.Close()
+		msg := std_msgs.NewMsgBool()
+		msg.Data = true
+		pub.Publish(msg)
+		return CommandResponse{Status: "success", Message: "Activate command sent", Result: nil}, nil
+
+	case "demo":
+		pub, err := r.node.NewPublisher("/launch_demo", std_msgs.MsgEmptyTypeSupport)
+		if err != nil {
+			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
+		}
+		defer pub.Close()
+		msg := std_msgs.NewMsgEmpty()
+		pub.Publish(msg)
+		return CommandResponse{Status: "success", Message: "Demo command sent", Result: nil}, nil
+
+	case "run":
+		appName, ok := cmd.Parameters["application"].(string)
+		if !ok {
+			return CommandResponse{Status: "error", Message: "Missing or invalid 'application' parameter"}, nil
+		}
+		pub, err := r.node.NewPublisher("/run_motion_application", std_msgs.MsgStringTypeSupport)
+		if err != nil {
+			return CommandResponse{Status: "error", Message: "Failed to create publisher"}, nil
+		}
+		defer pub.Close()
+		msg := std_msgs.NewMsgString()
+		msg.Data = appName
+		pub.Publish(msg)
+		return CommandResponse{Status: "success", Message: "Run command sent", Result: nil}, nil
+
+	default:
+		return CommandResponse{Status: "error", Message: "Unknown command type"}, nil
+	}
 }
 
 func main() {
-	_ = godotenv.Load() // Optional: load .env if present
-	if err := parseEnv(); err != nil {
-		panic(err)
-	}
+	cfg := loadConfig()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/status", handleStatus)
-	mux.HandleFunc("/cmd", handleCommand)
-
-	handler := cors.AllowAll().Handler(mux)
-
-	srv := &http.Server{
-		Addr:         serverHost + ":" + serverPort,
-		Handler:      handler,
-		ReadTimeout:  readTimeout,
-		WriteTimeout: writeTimeout,
-	}
-
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		panic(err)
-	}
-}
-
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Mutex to prevent concurrent ROS node usage
-	if !sem.TryAcquire(1) {
-		http.Error(w, "System busy", http.StatusTooManyRequests)
-		return
-	}
-	defer sem.Release(1)
-
-	node, err := rclgo.NewNode(ctx, ros2NodeName+"_status", "", rclgo.WithDomainID(uint(ros2DomainID)))
+	robot, err := NewRobotROS2(ctx, cfg.RosDomain)
 	if err != nil {
-		http.Error(w, "ROS2 node error: "+err.Error(), http.StatusInternalServerError)
-		return
+		log.Fatalf("Failed to initialize ROS 2 node: %v", err)
 	}
-	defer node.Close()
+	defer robot.node.Close()
 
-	type StatusMsg struct {
-		JointPositions      map[string]float64 `json:"joint_positions"`
-		JointFeedback       map[string]float64 `json:"joint_feedback"`
-		RobotPoses          map[string]float64 `json:"robot_poses"`
-		EndEffectorState    map[string]float64 `json:"end_effector_state"`
-		PlanningGroups      []string           `json:"planning_groups"`
-		RealTimeFeedback    map[string]float64 `json:"real_time_feedback"`
-		Synchronization     string             `json:"synchronization_status"`
-	}
-
-	var response StatusMsg
-	gotMsg := make(chan struct{})
-	sub, err := node.NewSubscription(ros2StatusTopic, std_msgs.MsgStringTypeSupport, func(msg *rclgo.Msg) {
-		// Assume robot publishes YAML or JSON string in std_msgs/String
-		strMsg := msg.Data.(*std_msgs.MsgString)
-		if err := yaml.Unmarshal([]byte(strMsg.Data), &response); err != nil {
-			_ = json.Unmarshal([]byte(strMsg.Data), &response) // Try JSON
+	// Start ROS2 spinning in a goroutine
+	go func() {
+		for {
+			robot.node.SpinOnce()
+			time.Sleep(10 * time.Millisecond)
 		}
-		close(gotMsg)
-	})
-	if err != nil {
-		http.Error(w, "ROS2 subscription error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer sub.Close()
+	}()
 
-	select {
-	case <-gotMsg:
-	case <-ctx.Done():
-		http.Error(w, "Timeout waiting for status", http.StatusGatewayTimeout)
-		return
-	}
+	// HTTP Handlers
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
-}
-
-func handleCommand(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var cmdReq CommandRequest
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		http.Error(w, "Invalid body", http.StatusBadRequest)
-		return
-	}
-	contentType := r.Header.Get("Content-Type")
-	switch contentType {
-	case "application/json":
-		if err := json.Unmarshal(body, &cmdReq); err != nil {
-			http.Error(w, "Bad JSON: "+err.Error(), http.StatusBadRequest)
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-	case "application/x-yaml", "text/yaml", "application/yaml":
-		if err := yaml.Unmarshal(body, &cmdReq); err != nil {
-			http.Error(w, "Bad YAML: "+err.Error(), http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(robot.status)
+	})
+
+	http.HandleFunc("/cmd", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-	default:
-		// Try JSON first, then YAML
-		if err := json.Unmarshal(body, &cmdReq); err != nil {
-			if err := yaml.Unmarshal(body, &cmdReq); err != nil {
-				http.Error(w, "Unsupported content type", http.StatusBadRequest)
-				return
-			}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
 		}
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	if !sem.TryAcquire(1) {
-		http.Error(w, "System busy", http.StatusTooManyRequests)
-		return
-	}
-	defer sem.Release(1)
-
-	node, err := rclgo.NewNode(ctx, ros2NodeName+"_cmd", "", rclgo.WithDomainID(uint(ros2DomainID)))
-	if err != nil {
-		http.Error(w, "ROS2 node error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer node.Close()
-
-	// Compose command message as JSON or YAML string
-	var cmdMsgStr string
-	if contentType == "application/json" || contentType == "" {
-		b, _ := json.Marshal(cmdReq)
-		cmdMsgStr = string(b)
-	} else {
-		b, _ := yaml.Marshal(cmdReq)
-		cmdMsgStr = string(b)
-	}
-
-	pub, err := node.NewPublisher(ros2CommandTopic, std_msgs.MsgStringTypeSupport)
-	if err != nil {
-		http.Error(w, "ROS2 publisher error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer pub.Close()
-
-	// Publish the command
-	msg := std_msgs.NewMsgString()
-	msg.Data = cmdMsgStr
-	if err := pub.Publish(msg); err != nil {
-		http.Error(w, "Failed to publish: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	// Optionally, listen for a feedback/ack topic, here we simply acknowledge
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(CommandResponse{
-		Status:  "accepted",
-		Message: "Command published",
+		var cmd CommandRequest
+		if err := json.Unmarshal(body, &cmd); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+		resp, err := robot.SendCommand(r.Context(), cmd)
+		if err != nil {
+			http.Error(w, "Failed to send command", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resp)
 	})
+
+	addr := cfg.ServerHost + ":" + strconv.Itoa(cfg.ServerPort)
+	log.Printf("Fairino Robot HTTP driver listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
