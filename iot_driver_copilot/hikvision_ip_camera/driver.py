@@ -1,91 +1,104 @@
 import os
+import io
 import threading
-import signal
-from flask import Flask, Response, jsonify, request
+import time
+import requests
+from flask import Flask, Response, send_file, jsonify, request, abort
 import cv2
 
-# Environment Variables
-DEVICE_IP = os.environ.get("DEVICE_IP")
-DEVICE_USER = os.environ.get("DEVICE_USER", "")
-DEVICE_PASS = os.environ.get("DEVICE_PASS", "")
-RTSP_PORT = os.environ.get("RTSP_PORT", "554")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# Configuration from environment variables
+CAMERA_IP = os.environ.get('CAMERA_IP')
+RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
+CAMERA_USER = os.environ.get('CAMERA_USER')
+CAMERA_PASS = os.environ.get('CAMERA_PASS')
+HTTP_HOST = os.environ.get('HTTP_HOST', '0.0.0.0')
+HTTP_PORT = int(os.environ.get('HTTP_PORT', 8080))
+RTSP_STREAM_PATH = os.environ.get('RTSP_STREAM_PATH', '/Streaming/Channels/101')
+SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
+ONVIF_PORT = int(os.environ.get('ONVIF_PORT', 80))  # Used for snapshot and status
 
-# RTSP URL Construction
-if DEVICE_USER and DEVICE_PASS:
-    RTSP_URL = f"rtsp://{DEVICE_USER}:{DEVICE_PASS}@{DEVICE_IP}:{RTSP_PORT}/Streaming/Channels/101"
-else:
-    RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/Streaming/Channels/101"
+# RTSP stream control
+streaming_enabled = False
+stream_lock = threading.Lock()
 
 app = Flask(__name__)
 
-streaming_active = threading.Event()
-stream_capture = None
-stream_lock = threading.Lock()
+def get_rtsp_url():
+    userpass = f"{CAMERA_USER}:{CAMERA_PASS}@" if CAMERA_USER and CAMERA_PASS else ""
+    return f"rtsp://{userpass}{CAMERA_IP}:{RTSP_PORT}{RTSP_STREAM_PATH}"
 
-def gen_frames():
-    global stream_capture
-    while streaming_active.is_set():
-        with stream_lock:
-            if stream_capture is not None:
-                ret, frame = stream_capture.read()
-                if not ret:
+def get_snapshot_url():
+    userpass = f"{CAMERA_USER}:{CAMERA_PASS}@" if CAMERA_USER and CAMERA_PASS else ""
+    return f"http://{CAMERA_IP}:{ONVIF_PORT}{SNAPSHOT_PATH}"
+
+def gen_mjpeg():
+    global streaming_enabled
+    cap = None
+    try:
+        cap = cv2.VideoCapture(get_rtsp_url())
+        if not cap.isOpened():
+            yield b''
+            return
+        while True:
+            with stream_lock:
+                if not streaming_enabled:
                     break
-                # JPEG encode
-                ret, buffer = cv2.imencode('.jpg', frame)
-                if not ret:
-                    continue
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            else:
+            ret, frame = cap.read()
+            if not ret:
                 break
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = jpeg.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.04)  # ~25 FPS
+    finally:
+        if cap:
+            cap.release()
 
 @app.route('/start', methods=['POST'])
 def start_stream():
-    global stream_capture
-    if streaming_active.is_set():
-        return jsonify({"status": "already streaming"}), 200
+    global streaming_enabled
     with stream_lock:
-        stream_capture = cv2.VideoCapture(RTSP_URL)
-        if not stream_capture.isOpened():
-            stream_capture.release()
-            stream_capture = None
-            return jsonify({"status": "error", "message": "Failed to open RTSP stream"}), 500
-        streaming_active.set()
+        streaming_enabled = True
     return jsonify({"status": "streaming started"}), 200
 
 @app.route('/stop', methods=['POST'])
 def stop_stream():
-    global stream_capture
-    if not streaming_active.is_set():
-        return jsonify({"status": "already stopped"}), 200
-    streaming_active.clear()
+    global streaming_enabled
     with stream_lock:
-        if stream_capture is not None:
-            stream_capture.release()
-            stream_capture = None
+        streaming_enabled = False
     return jsonify({"status": "streaming stopped"}), 200
 
-@app.route('/video')
-def video_feed():
-    if not streaming_active.is_set():
-        return jsonify({"status": "not streaming"}), 400
-    return Response(gen_frames(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/snap', methods=['POST'])
+def snap():
+    # Try HTTP snapshot API first
+    try:
+        url = get_snapshot_url()
+        resp = requests.get(url, auth=(CAMERA_USER, CAMERA_PASS) if CAMERA_USER and CAMERA_PASS else None, timeout=3)
+        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
+            return Response(resp.content, mimetype='image/jpeg')
+    except Exception:
+        pass
+    # Fallback: grab a frame from RTSP stream
+    cap = cv2.VideoCapture(get_rtsp_url())
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        return abort(500, description='Unable to capture snapshot')
+    ret, jpeg = cv2.imencode('.jpg', frame)
+    if not ret:
+        return abort(500, description='JPEG encoding error')
+    return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
-def cleanup(*args):
-    global stream_capture
-    streaming_active.clear()
+@app.route('/live', methods=['GET'])
+def live():
+    global streaming_enabled
     with stream_lock:
-        if stream_capture is not None:
-            stream_capture.release()
-            stream_capture = None
-    os._exit(0)
-
-signal.signal(signal.SIGINT, cleanup)
-signal.signal(signal.SIGTERM, cleanup)
+        if not streaming_enabled:
+            return abort(403, description='Stream not started. Use /start to enable streaming.')
+    return Response(gen_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
