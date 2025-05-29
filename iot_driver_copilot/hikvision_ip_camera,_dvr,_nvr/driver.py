@@ -1,209 +1,258 @@
 import os
-import signal
 import sys
-import threading
-import time
 import base64
 import yaml
-import json
+import time
+import threading
+import logging
+import signal
+from io import BytesIO
+from datetime import datetime
+
+import requests
+import cv2
+import numpy as np
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
 import paho.mqtt.client as mqtt
 
-EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
-EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
-MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
-INSTRUCTION_CONFIG_PATH = "/etc/edgedevice/config/instructions"
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
 
-if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
-    raise RuntimeError("EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, and MQTT_BROKER_ADDRESS must be set.")
+# Constants
+INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions'
+EDGEDEVICE_CRD_GROUP = 'shifu.edgenesis.io'
+EDGEDEVICE_CRD_VERSION = 'v1alpha1'
+EDGEDEVICE_CRD_PLURAL = 'edgedevices'
+STATUS_PHASES = ["Pending", "Running", "Failed", "Unknown"]
+FRAME_TOPIC = "device/camera/frame"
+FRAME_QOS = 1
+FRAME_PUBLISH_INTERVAL = 1 / 5  # 5 FPS default
 
-# Constants for Edgedevice CRD
-CRD_GROUP = "shifu.edgenesis.io"
-CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "edgedevices"
+# Get required ENV vars
+def get_env(name, required=True):
+    val = os.environ.get(name)
+    if required and not val:
+        logging.error(f"Missing required environment variable: {name}")
+        sys.exit(1)
+    return val
 
-# MQTT topic for video frame
-MQTT_TOPIC_CAMERA_FRAME = "device/camera/frame"
-MQTT_QOS_CAMERA_FRAME = 1
+EDGEDEVICE_NAME = get_env("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = get_env("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = get_env("MQTT_BROKER_ADDRESS")
 
-# Device phase constants
-PHASE_PENDING = "Pending"
-PHASE_RUNNING = "Running"
-PHASE_FAILED = "Failed"
-PHASE_UNKNOWN = "Unknown"
-
-# Read instruction config
-def read_instruction_config():
+# Load instructions/config (YAML)
+def load_instructions(path):
     try:
-        with open(INSTRUCTION_CONFIG_PATH, "r") as f:
+        with open(path, 'r') as f:
             return yaml.safe_load(f)
-    except Exception:
+    except Exception as e:
+        logging.error(f"Failed to read instructions file: {e}")
         return {}
 
-class EdgedeviceStatusManager:
-    def __init__(self, name, namespace):
-        # Use incluster config, fallback to kubeconfig for local dev
-        try:
-            config.load_incluster_config()
-        except Exception:
-            config.load_kube_config()
-        self.custom_api = client.CustomObjectsApi()
-        self.name = name
-        self.namespace = namespace
-        self.last_phase = None
+instructions = load_instructions(INSTRUCTIONS_PATH)
 
-    def get_edgedevice(self):
-        try:
-            return self.custom_api.get_namespaced_custom_object(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                namespace=self.namespace,
-                plural=CRD_PLURAL,
-                name=self.name
-            )
-        except ApiException:
-            return None
+# Get camera RTSP address from Kubernetes Edgedevice CR
+def get_camera_address():
+    try:
+        config.load_incluster_config()
+        api = client.CustomObjectsApi()
+        cr = api.get_namespaced_custom_object(
+            group=EDGEDEVICE_CRD_GROUP,
+            version=EDGEDEVICE_CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=EDGEDEVICE_CRD_PLURAL,
+            name=EDGEDEVICE_NAME
+        )
+        address = cr.get("spec", {}).get("address")
+        if not address:
+            raise Exception("No camera address found in Edgedevice.spec.address")
+        return address
+    except Exception as e:
+        logging.error(f"Failed to get camera address from Edgedevice CR: {e}")
+        set_device_phase("Unknown")
+        sys.exit(1)
 
-    def update_phase(self, phase):
-        if self.last_phase == phase:
-            return
-        for _ in range(3):
-            try:
-                edgedevice = self.get_edgedevice()
-                if not edgedevice:
-                    continue
-                # Patch status
-                body = {"status": {"edgedevicephase": phase}}
-                self.custom_api.patch_namespaced_custom_object_status(
-                    group=CRD_GROUP,
-                    version=CRD_VERSION,
-                    namespace=self.namespace,
-                    plural=CRD_PLURAL,
-                    name=self.name,
-                    body=body
-                )
-                self.last_phase = phase
-                return
-            except ApiException:
-                time.sleep(1)
+# Status management
+def set_device_phase(phase):
+    if phase not in STATUS_PHASES:
+        phase = "Unknown"
+    try:
+        config.load_incluster_config()
+        api = client.CustomObjectsApi()
+        body = {"status": {"edgedevicephase": phase}}
+        api.patch_namespaced_custom_object_status(
+            group=EDGEDEVICE_CRD_GROUP,
+            version=EDGEDEVICE_CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=EDGEDEVICE_CRD_PLURAL,
+            name=EDGEDEVICE_NAME,
+            body=body
+        )
+        logging.info(f"Set Edgedevice phase: {phase}")
+    except ApiException as e:
+        logging.error(f"Failed to update Edgedevice phase: {e}")
 
-class MQTTFrameSubscriber:
-    def __init__(self, broker_address, topic, qos, status_manager, protocol_settings):
-        self.broker_address = broker_address
-        self.topic = topic
-        self.qos = qos
-        self.status_manager = status_manager
-        self.protocol_settings = protocol_settings
+# MQTT Client
+class MqttPublisher:
+    def __init__(self, broker_addr):
+        self.broker_host, self.broker_port = self._parse_broker(broker_addr)
         self.client = mqtt.Client()
         self.connected = False
-        self.should_stop = threading.Event()
+        self.should_stop = False
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
 
-        # On connect
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_message = self._on_message
-
-        # Optional: setup username/password or TLS
-        if self.protocol_settings:
-            username = self.protocol_settings.get("username")
-            password = self.protocol_settings.get("password")
-            if username:
-                self.client.username_pw_set(username, password)
-            # TLS, keepalive etc. can be set here from protocol_settings
-
-    def _on_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            self.connected = True
-            self.status_manager.update_phase(PHASE_RUNNING)
-            client.subscribe(self.topic, self.qos)
-        else:
-            self.status_manager.update_phase(PHASE_FAILED)
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.connected = False
-        if rc != 0:
-            self.status_manager.update_phase(PHASE_FAILED)
-        else:
-            self.status_manager.update_phase(PHASE_PENDING)
-
-    def _on_message(self, client, userdata, msg):
-        try:
-            payload = msg.payload.decode('utf-8')
-            data = json.loads(payload)
-            # Expected: {'timestamp': ..., 'frame_number': ..., 'frame': 'base64str'}
-            # Here you would process the frame, for demo just print metadata
-            print(f"Received frame: timestamp={data.get('timestamp')}, frame_number={data.get('frame_number')}, size={len(data.get('frame', ''))}")
-        except Exception as e:
-            print(f"Error decoding message: {e}")
+    def _parse_broker(self, addr):
+        # Accept forms: mqtt://host:port or host:port
+        addr = addr.replace("mqtt://", "")
+        if ":" not in addr:
+            logging.error("MQTT_BROKER_ADDRESS must be in host:port format.")
+            sys.exit(1)
+        host, port = addr.split(":", 1)
+        return host, int(port)
 
     def start(self):
-        broker, port = self._parse_broker_address(self.broker_address)
         try:
-            self.client.connect(broker, port, keepalive=60)
-        except Exception:
-            self.status_manager.update_phase(PHASE_FAILED)
-            return
-        t = threading.Thread(target=self._loop_forever)
-        t.daemon = True
-        t.start()
-
-    def _loop_forever(self):
-        self.client.loop_start()
-        while not self.should_stop.is_set():
-            if not self.connected:
-                self.status_manager.update_phase(PHASE_PENDING)
-            time.sleep(2)
-        self.client.loop_stop()
+            self.client.connect(self.broker_host, self.broker_port, keepalive=60)
+            self.client.loop_start()
+        except Exception as e:
+            logging.error(f"Failed to connect to MQTT broker: {e}")
+            self.connected = False
 
     def stop(self):
-        self.should_stop.set()
+        self.should_stop = True
+        self.client.loop_stop()
         self.client.disconnect()
 
-    @staticmethod
-    def _parse_broker_address(address):
-        if ':' in address:
-            host, port = address.rsplit(':', 1)
-            return host, int(port)
-        return address, 1883
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected = True
+            logging.info("Connected to MQTT Broker.")
+        else:
+            self.connected = False
+            logging.error(f"Failed to connect to MQTT Broker, rc={rc}")
 
+    def on_disconnect(self, client, userdata, rc):
+        self.connected = False
+        logging.warning("Disconnected from MQTT Broker.")
+
+    def publish(self, topic, payload, qos=1):
+        if self.connected:
+            result = self.client.publish(topic, payload, qos=qos)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                logging.error(f"Failed to publish to MQTT: {mqtt.error_string(result.rc)}")
+        else:
+            logging.warning("MQTT client not connected, skipping publish.")
+
+# Video Frame Fetcher
+class VideoFrameStreamer:
+    def __init__(self, rtsp_url, mqtt_publisher, topic, qos, interval, settings):
+        self.rtsp_url = rtsp_url
+        self.publisher = mqtt_publisher
+        self.topic = topic
+        self.qos = qos
+        self.interval = interval
+        self.settings = settings or {}
+        self.should_stop = False
+
+    def start(self):
+        self.should_stop = False
+        threading.Thread(target=self.stream_frames, daemon=True).start()
+
+    def stop(self):
+        self.should_stop = True
+
+    def stream_frames(self):
+        set_device_phase("Pending")
+        cap = None
+        try:
+            cap = cv2.VideoCapture(self.rtsp_url)
+            if not cap.isOpened():
+                logging.error("Failed to open RTSP stream.")
+                set_device_phase("Failed")
+                return
+            set_device_phase("Running")
+            while not self.should_stop:
+                ret, frame = cap.read()
+                if not ret:
+                    logging.warning("Failed to grab frame, retrying...")
+                    set_device_phase("Failed")
+                    time.sleep(2)
+                    continue
+                set_device_phase("Running")
+                # Optionally resize if configured
+                if "resize" in self.settings:
+                    width = self.settings["resize"].get("width")
+                    height = self.settings["resize"].get("height")
+                    if width and height:
+                        frame = cv2.resize(frame, (int(width), int(height)))
+                # Encode frame as JPEG
+                _, buf = cv2.imencode('.jpg', frame)
+                b64_frame = base64.b64encode(buf.tobytes()).decode('utf-8')
+                payload = {
+                    "timestamp": datetime.utcnow().isoformat() + 'Z',
+                    "frame_number": int(cap.get(cv2.CAP_PROP_POS_FRAMES)),
+                    "frame": b64_frame
+                }
+                self.publisher.publish(self.topic, mqtt_payload_json(payload), qos=self.qos)
+                time.sleep(self.interval)
+        except Exception as e:
+            logging.error(f"Exception in video streaming: {e}")
+            set_device_phase("Failed")
+        finally:
+            if cap:
+                cap.release()
+            set_device_phase("Pending")
+
+def mqtt_payload_json(obj):
+    import json
+    return json.dumps(obj)
+
+# Parse settings for api
+api_settings = {}
+if instructions and "device/camera/frame" in instructions:
+    api_settings = instructions["device/camera/frame"].get("protocolPropertyList", {})
+
+# Optionally override FPS from settings
+fps = int(api_settings.get("fps", 5)) if api_settings.get("fps") else 5
+FRAME_PUBLISH_INTERVAL = 1.0 / fps if fps > 0 else 1.0 / 5
+
+# Main logic
 def main():
-    # Handle termination signals
+    # Signal handler
     stop_event = threading.Event()
-    def handle_sigterm(*_):
+    def sigterm_handler(signum, frame):
         stop_event.set()
-    signal.signal(signal.SIGTERM, handle_sigterm)
-    signal.signal(signal.SIGINT, handle_sigterm)
+    signal.signal(signal.SIGTERM, sigterm_handler)
+    signal.signal(signal.SIGINT, sigterm_handler)
 
-    # Phase: Pending (initial)
-    status_manager = EdgedeviceStatusManager(EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE)
-    status_manager.update_phase(PHASE_PENDING)
-
-    # Load protocol config for the API (if any)
-    instructions = read_instruction_config()
-    protocol_settings = {}
-    api_conf = instructions.get("device/camera/frame")
-    if api_conf and "protocolPropertyList" in api_conf:
-        protocol_settings = api_conf["protocolPropertyList"]
-
-    # Start MQTT frame subscriber
-    subscriber = MQTTFrameSubscriber(
-        broker_address=MQTT_BROKER_ADDRESS,
-        topic=MQTT_TOPIC_CAMERA_FRAME,
-        qos=MQTT_QOS_CAMERA_FRAME,
-        status_manager=status_manager,
-        protocol_settings=protocol_settings
+    set_device_phase("Pending")
+    rtsp_url = get_camera_address()
+    mqtt_pub = MqttPublisher(MQTT_BROKER_ADDRESS)
+    mqtt_pub.start()
+    streamer = VideoFrameStreamer(
+        rtsp_url=rtsp_url,
+        mqtt_publisher=mqtt_pub,
+        topic=FRAME_TOPIC,
+        qos=FRAME_QOS,
+        interval=FRAME_PUBLISH_INTERVAL,
+        settings=api_settings
     )
-    subscriber.start()
+    streamer.start()
 
-    # Main loop: monitor & keep alive
-    while not stop_event.is_set():
-        time.sleep(1)
-
-    subscriber.stop()
-    status_manager.update_phase(PHASE_PENDING)
+    try:
+        while not stop_event.is_set():
+            time.sleep(1)
+    finally:
+        streamer.stop()
+        mqtt_pub.stop()
+        set_device_phase("Pending")
 
 if __name__ == "__main__":
     main()
