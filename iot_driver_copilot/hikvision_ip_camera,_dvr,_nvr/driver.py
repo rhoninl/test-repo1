@@ -1,177 +1,182 @@
 import os
-import sys
 import time
-import signal
 import threading
 import base64
 import json
 import yaml
-from typing import Any, Dict
-
-import paho.mqtt.client as mqtt
+import logging
+import signal
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-CONFIGMAP_PATH = '/etc/edgedevice/config/instructions.yaml'
-CRD_GROUP = 'shifu.edgenesis.io'
-CRD_VERSION = 'v1alpha1'
-CRD_PLURAL = 'edgedevices'
-CRD_KIND = 'Edgedevice'
+import paho.mqtt.client as mqtt
 
-# Environment variables
-EDGEDEVICE_NAME = os.environ.get('EDGEDEVICE_NAME')
-EDGEDEVICE_NAMESPACE = os.environ.get('EDGEDEVICE_NAMESPACE')
-MQTT_BROKER_ADDRESS = os.environ.get('MQTT_BROKER_ADDRESS')
+CONFIGMAP_PATH = "/etc/edgedevice/config/instructions"
 
-if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
-    sys.stderr.write('Required environment variables: EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, MQTT_BROKER_ADDRESS\n')
-    sys.exit(1)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# --- Load instructions.yaml ---
-def load_instructions() -> Dict[str, Any]:
-    if not os.path.exists(CONFIGMAP_PATH):
-        return {}
-    with open(CONFIGMAP_PATH, 'r') as f:
-        return yaml.safe_load(f) or {}
+# ---- Kubernetes CRD Updater ----
+class EdgeDeviceCRDManager:
+    def __init__(self, name, namespace):
+        self.name = name
+        self.namespace = namespace
+        try:
+            config.load_incluster_config()
+            self.api = client.CustomObjectsApi()
+            logging.info("Loaded in-cluster k8s config")
+        except Exception as e:
+            logging.error(f"Failed to load k8s config: {e}")
+            self.api = None
 
-INSTRUCTIONS = load_instructions()
+    def set_phase(self, phase):
+        if not self.api:
+            return
+        body = {'status': {'edgedevicephase': phase}}
+        for _ in range(3):
+            try:
+                self.api.patch_namespaced_custom_object_status(
+                    group="shifu.edgenesis.io",
+                    version="v1alpha1",
+                    namespace=self.namespace,
+                    plural="edgedevices",
+                    name=self.name,
+                    body=body
+                )
+                logging.info(f"Set edgedevicephase to {phase}")
+                return
+            except ApiException as e:
+                logging.warning(f"Failed to update CRD status: {e}")
+                time.sleep(1)
 
-def get_api_settings(api_name: str) -> Dict[str, Any]:
-    return INSTRUCTIONS.get(api_name, {}).get('protocolPropertyList', {})
-
-# --- Kubernetes CRD Status Management ---
-def get_k8s_api():
+# ---- Config Reader ----
+def read_api_settings(api_name):
     try:
-        config.load_incluster_config()
+        with open(CONFIGMAP_PATH, "r") as f:
+            configmap_data = yaml.safe_load(f)
+        return configmap_data.get(api_name, {}).get("protocolPropertyList", {})
     except Exception as e:
-        sys.stderr.write(f'Failed to load incluster config: {e}\n')
-        sys.exit(1)
-    return client.CustomObjectsApi()
+        logging.warning(f"Failed to read configmap: {e}")
+        return {}
 
-def update_edgedevice_status(phase: str):
-    api = get_k8s_api()
-    status_obj = {'status': {'edgedevicephase': phase}}
-    try:
-        api.patch_namespaced_custom_object_status(
-            group=CRD_GROUP,
-            version=CRD_VERSION,
-            namespace=EDGEDEVICE_NAMESPACE,
-            plural=CRD_PLURAL,
-            name=EDGEDEVICE_NAME,
-            body=status_obj
-        )
-    except ApiException as e:
-        sys.stderr.write(f"Failed to update Edgedevice status: {e}\n")
-
-# --- MQTT Client Logic ---
-class CameraMQTTClient:
-    def __init__(self, broker_address, topic, qos):
-        self.broker_host, self.broker_port = self._parse_broker_address(broker_address)
+# ---- MQTT Client Handler ----
+class MQTTFrameSubscriber:
+    def __init__(self, broker_address, topic, qos, crd_manager):
+        self.broker_address = broker_address
         self.topic = topic
         self.qos = qos
+        self.crd_manager = crd_manager
         self.client = mqtt.Client()
         self.connected = False
         self.should_stop = threading.Event()
-        self._setup_callbacks()
 
-    def _parse_broker_address(self, addr: str):
-        if ':' not in addr:
-            return addr, 1883
-        host, port = addr.rsplit(':', 1)
-        return host, int(port)
-
-    def _setup_callbacks(self):
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
 
     def connect(self):
         try:
-            self.client.connect(self.broker_host, self.broker_port, keepalive=60)
-            self.connected = True
-            update_edgedevice_status('Running')
+            host, port = self.broker_address.split(':')
+            port = int(port)
+            self.client.connect(host, port, keepalive=60)
+            self.client.loop_start()
         except Exception as e:
-            sys.stderr.write(f'MQTT connection failed: {e}\n')
+            logging.error(f"MQTT connection failed: {e}")
+            self.crd_manager.set_phase("Failed")
             self.connected = False
-            update_edgedevice_status('Failed')
-            return
-        self.client.loop_start()
-
-    def disconnect(self):
-        self.should_stop.set()
-        self.client.loop_stop()
-        self.client.disconnect()
-        self.connected = False
-        update_edgedevice_status('Pending')
-
-    def subscribe(self):
-        try:
-            self.client.subscribe(self.topic, qos=self.qos)
-        except Exception as e:
-            sys.stderr.write(f'Failed to subscribe: {e}\n')
-            update_edgedevice_status('Failed')
 
     def on_connect(self, client, userdata, flags, rc):
         if rc == 0:
             self.connected = True
-            update_edgedevice_status('Running')
-            self.subscribe()
+            self.crd_manager.set_phase("Running")
+            logging.info(f"Connected to MQTT broker at {self.broker_address}")
+            client.subscribe(self.topic, qos=self.qos)
+            logging.info(f"Subscribed to topic: {self.topic} (qos={self.qos})")
         else:
-            sys.stderr.write('Failed to connect to MQTT broker, return code %d\n' % rc)
+            logging.error(f"MQTT connection failed with code {rc}")
+            self.crd_manager.set_phase("Failed")
             self.connected = False
-            update_edgedevice_status('Failed')
 
     def on_disconnect(self, client, userdata, rc):
         self.connected = False
         if not self.should_stop.is_set():
-            update_edgedevice_status('Pending')
+            logging.warning("MQTT disconnected unexpectedly, setting device phase to Pending")
+            self.crd_manager.set_phase("Pending")
 
     def on_message(self, client, userdata, msg):
         try:
-            payload = msg.payload.decode('utf-8')
+            payload = msg.payload.decode("utf-8")
             data = json.loads(payload)
-            # Example: print frame metadata and truncate frame data for log brevity
-            frame_info = {
-                k: v for k, v in data.items() if k != 'frame'
-            }
-            print(f"[Camera Frame Received] Topic: {msg.topic}, Metadata: {frame_info}")
-            # Frame data (base64) is available as data['frame']
+            ts = data.get("timestamp")
+            frame_b64 = data.get("frame")
+            frame_number = data.get("frame_number")
+            # Here we just log reception; in a real deployment, we'd process/store frame.
+            if frame_b64:
+                logging.info(f"Received frame {frame_number} at {ts} (size={len(frame_b64)} base64 chars)")
+            else:
+                logging.info(f"Received message with no frame in topic {msg.topic}")
         except Exception as e:
-            sys.stderr.write(f'Error handling incoming frame: {e}\n')
+            logging.error(f"Failed to process received MQTT message: {e}")
 
-    def loop_forever(self):
-        while not self.should_stop.is_set():
-            if not self.connected:
-                try:
-                    self.connect()
-                except Exception:
-                    update_edgedevice_status('Failed')
-                    time.sleep(5)
-            time.sleep(1)
+    def stop(self):
+        self.should_stop.set()
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
 
-def graceful_shutdown(sig, frame, client: CameraMQTTClient):
-    client.disconnect()
-    update_edgedevice_status('Pending')
-    sys.exit(0)
+# ---- Main Entrypoint ----
+class DeviceShifuDriver:
+    def __init__(self):
+        self.device_name = os.environ.get("EDGEDEVICE_NAME")
+        self.device_namespace = os.environ.get("EDGEDEVICE_NAMESPACE")
+        self.mqtt_broker_address = os.environ.get("MQTT_BROKER_ADDRESS")
 
-def main():
-    # Get MQTT topic settings from configmap or default
-    settings = get_api_settings('device/camera/frame')
-    topic = settings.get('topic', 'device/camera/frame')
-    qos = int(settings.get('qos', 1))
-    mqtt_client = CameraMQTTClient(MQTT_BROKER_ADDRESS, topic, qos)
+        if not self.device_name or not self.device_namespace or not self.mqtt_broker_address:
+            logging.error("Missing required environment variables: EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE, MQTT_BROKER_ADDRESS")
+            exit(1)
 
-    signal.signal(signal.SIGTERM, lambda sig, frm: graceful_shutdown(sig, frm, mqtt_client))
-    signal.signal(signal.SIGINT, lambda sig, frm: graceful_shutdown(sig, frm, mqtt_client))
+        self.crd_manager = EdgeDeviceCRDManager(self.device_name, self.device_namespace)
+        self.crd_manager.set_phase("Pending")
 
-    try:
-        update_edgedevice_status('Pending')
-        mqtt_client.loop_forever()
-    except Exception as e:
-        sys.stderr.write(f'Unexpected error: {e}\n')
-        update_edgedevice_status('Unknown')
-        sys.exit(1)
+        # Read configmap for topic/qos
+        api_settings = read_api_settings("device/camera/frame")
+        self.topic = "device/camera/frame"
+        self.qos = 1
+        if "qos" in api_settings:
+            try:
+                self.qos = int(api_settings["qos"])
+            except Exception:
+                pass
+        if "topic" in api_settings:
+            self.topic = api_settings["topic"]
 
-if __name__ == '__main__':
-    main()
+        self.subscriber = MQTTFrameSubscriber(
+            broker_address=self.mqtt_broker_address,
+            topic=self.topic,
+            qos=self.qos,
+            crd_manager=self.crd_manager
+        )
+
+    def run(self):
+        def handle_signal(signum, frame):
+            logging.info("Signal received, shutting down gracefully...")
+            self.subscriber.stop()
+            self.crd_manager.set_phase("Pending")
+            exit(0)
+        signal.signal(signal.SIGTERM, handle_signal)
+        signal.signal(signal.SIGINT, handle_signal)
+
+        self.crd_manager.set_phase("Pending")
+        self.subscriber.connect()
+
+        # Monitor connection and update status
+        while not self.subscriber.should_stop.is_set():
+            if not self.subscriber.connected:
+                self.crd_manager.set_phase("Pending")
+            time.sleep(2)
+
+if __name__ == "__main__":
+    driver = DeviceShifuDriver()
+    driver.run()
