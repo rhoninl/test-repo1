@@ -1,293 +1,269 @@
 import os
-import json
-import time
 import threading
-from datetime import datetime
-from io import BytesIO
-
-from flask import Flask, Response, request, jsonify, stream_with_context
-
+import time
+import json
 import requests
-import paho.mqtt.client as mqtt
+import queue
+import base64
+from flask import Flask, request, Response, jsonify, stream_with_context
 
-app = Flask(__name__)
+try:
+    import paho.mqtt.client as mqtt
+except ImportError:
+    raise ImportError("paho-mqtt is required, install it via pip")
 
-# Environment variable configuration
+# Environment variable config
 HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
 HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+MQTT_BROKER_HOST = os.environ.get("MQTT_BROKER_HOST", "localhost")
+MQTT_BROKER_PORT = int(os.environ.get("MQTT_BROKER_PORT", "1883"))
+MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "hikvision/camera/stream")
+MQTT_CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", "hikvision_driver_client")
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
+CAMERA_URL = os.environ.get("CAMERA_URL", "http://192.168.1.64/ISAPI/Streaming/channels/101/httpPreview")
+CAMERA_USERNAME = os.environ.get("CAMERA_USERNAME")
+CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD")
+CAMERA_STREAM_PATH = os.environ.get("CAMERA_STREAM_PATH", "/ISAPI/Streaming/channels/101/httpPreview")
+CAMERA_PROTOCOL = os.environ.get("CAMERA_PROTOCOL", "http")
+CAMERA_IP = os.environ.get("CAMERA_IP", "192.168.1.64")
+CAMERA_PORT = os.environ.get("CAMERA_PORT", "80")
 
-# Persistent configuration (in-memory for this example; use files/db in production)
-CONFIG_PATH = "config.json"
-DEFAULT_CONFIG = {
+# Persisted config (in-memory for simplicity)
+persisted = {
     "camera": {
-        "url": os.environ.get("CAMERA_URL", ""),
-        "username": os.environ.get("CAMERA_USERNAME", ""),
-        "password": os.environ.get("CAMERA_PASSWORD", ""),
-        "stream_path": os.environ.get("CAMERA_STREAM_PATH", "/Streaming/channels/101/httpPreview"),
+        "url": CAMERA_URL,
+        "username": CAMERA_USERNAME,
+        "password": CAMERA_PASSWORD,
+        "stream_path": CAMERA_STREAM_PATH,
+        "protocol": CAMERA_PROTOCOL,
+        "ip": CAMERA_IP,
+        "port": CAMERA_PORT
     },
     "mqtt": {
-        "host": os.environ.get("MQTT_HOST", "localhost"),
-        "port": int(os.environ.get("MQTT_PORT", "1883")),
-        "topic": os.environ.get("MQTT_TOPIC", "hikvision/stream"),
-        "username": os.environ.get("MQTT_USERNAME", ""),
-        "password": os.environ.get("MQTT_PASSWORD", ""),
-        "client_id": os.environ.get("MQTT_CLIENT_ID", "hikvision_forwarder"),
-        "tls": False
+        "broker_host": MQTT_BROKER_HOST,
+        "broker_port": MQTT_BROKER_PORT,
+        "topic": MQTT_TOPIC,
+        "client_id": MQTT_CLIENT_ID,
+        "username": MQTT_USERNAME,
+        "password": MQTT_PASSWORD
     }
 }
 
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
-    else:
-        return DEFAULT_CONFIG.copy()
+status = {
+    "forwarding": False,
+    "uptime": 0,
+    "frames_published": 0,
+    "last_error": None,
+    "start_time": None,
+    "fps": 0
+}
 
-def save_config(cfg):
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(cfg, f)
-
-config = load_config()
-
-# Streaming/forwarding status
-class StreamStatus:
-    def __init__(self):
-        self.active = False
-        self.started_at = None
+# MQTT Forwarding Worker
+class StreamForwarder(threading.Thread):
+    def __init__(self, camera_conf, mqtt_conf):
+        super().__init__()
+        self.camera_conf = camera_conf
+        self.mqtt_conf = mqtt_conf
+        self._stop_event = threading.Event()
         self.frames_published = 0
+        self.fps = 0
         self.last_error = None
-        self.fps = 0.0
-        self._frame_times = []
+        self._client = None
 
-    def start(self):
-        self.active = True
-        self.started_at = datetime.now().isoformat()
-        self.frames_published = 0
-        self.last_error = None
-        self.fps = 0.0
-        self._frame_times = []
+    def run(self):
+        global status
+        mqttc = mqtt.Client(self.mqtt_conf["client_id"])
+        if self.mqtt_conf["username"]:
+            mqttc.username_pw_set(self.mqtt_conf["username"], self.mqtt_conf["password"])
+        try:
+            mqttc.connect(self.mqtt_conf["broker_host"], int(self.mqtt_conf["broker_port"]), 60)
+        except Exception as e:
+            status["last_error"] = f"MQTT connect error: {str(e)}"
+            status["forwarding"] = False
+            return
+        self._client = mqttc
+
+        url = self.camera_conf.get("url") or f'{self.camera_conf["protocol"]}://{self.camera_conf["ip"]}:{self.camera_conf["port"]}{self.camera_conf["stream_path"]}'
+        auth = None
+        if self.camera_conf.get("username"):
+            auth = (self.camera_conf["username"], self.camera_conf["password"])
+
+        # ISAPI HTTP stream is multipart/x-mixed-replace; boundary=... (MJPEG)
+        try:
+            with requests.get(url, auth=auth, stream=True, timeout=10) as r:
+                r.raise_for_status()
+                boundary = None
+                ct = r.headers.get("Content-Type", "")
+                if "boundary=" in ct:
+                    boundary = ct.split("boundary=")[-1]
+                    if boundary.startswith('"') and boundary.endswith('"'):
+                        boundary = boundary[1:-1]
+                else:
+                    boundary = "--myboundary"
+                delimiter = b"--" + boundary.encode("utf-8")
+                buf = b""
+                last_frame_time = time.time()
+                frame_count = 0
+                period = 1
+                start = time.time()
+                for chunk in r.iter_content(chunk_size=4096):
+                    if self._stop_event.is_set():
+                        break
+                    buf += chunk
+                    while True:
+                        # Find the next delimiter
+                        start_idx = buf.find(delimiter)
+                        if start_idx < 0:
+                            break
+                        # Find the next delimiter after start_idx+len(delimiter)
+                        next_idx = buf.find(delimiter, start_idx + len(delimiter))
+                        if next_idx < 0:
+                            break
+                        frame = buf[start_idx + len(delimiter):next_idx]
+                        buf = buf[next_idx:]
+                        # Frame headers and JPEG data
+                        # Remove potential \r\n at start
+                        frame = frame.lstrip(b"\r\n")
+                        # Find end of headers
+                        header_end = frame.find(b"\r\n\r\n")
+                        if header_end < 0:
+                            continue
+                        headers = frame[:header_end]
+                        jpeg_data = frame[header_end + 4:]
+                        # Publish to MQTT as base64-encoded JPEG with timestamp and meta
+                        payload = {
+                            "timestamp": time.time(),
+                            "image_base64": base64.b64encode(jpeg_data).decode("ascii"),
+                            "content_type": "image/jpeg"
+                        }
+                        try:
+                            mqttc.publish(self.mqtt_conf["topic"], json.dumps(payload), qos=0)
+                        except Exception as me:
+                            status["last_error"] = f"MQTT publish error: {str(me)}"
+                            self.last_error = status["last_error"]
+                            status["forwarding"] = False
+                            return
+                        self.frames_published += 1
+                        frame_count += 1
+                        now = time.time()
+                        if now - last_frame_time > period:
+                            self.fps = frame_count / (now - last_frame_time)
+                            last_frame_time = now
+                            frame_count = 0
+                status["fps"] = self.fps
+        except Exception as e:
+            status["last_error"] = f"Stream error: {str(e)}"
+            self.last_error = status["last_error"]
+            status["forwarding"] = False
+            return
+        status["forwarding"] = False
 
     def stop(self):
-        self.active = False
-        self.fps = 0.0
-        self._frame_times = []
+        self._stop_event.set()
 
-    def frame(self):
-        now = time.time()
-        self.frames_published += 1
-        self._frame_times.append(now)
-        # Keep only last 5 seconds for FPS calc
-        self._frame_times = [t for t in self._frame_times if now - t < 5]
-        if len(self._frame_times) > 1:
-            self.fps = len(self._frame_times) / (self._frame_times[-1] - self._frame_times[0] + 1e-6)
-        else:
-            self.fps = 0.0
+forwarder = None
+forwarder_lock = threading.Lock()
 
-    def error(self, msg):
-        self.last_error = msg
+app = Flask(__name__)
 
-    def to_dict(self):
-        uptime = 0
-        if self.active and self.started_at:
-            uptime = (datetime.now() - datetime.fromisoformat(self.started_at)).total_seconds()
-        return {
-            "active": self.active,
-            "uptime_sec": uptime,
-            "frames_published": self.frames_published,
-            "fps": round(self.fps, 2),
-            "last_error": self.last_error
-        }
-
-stream_status = StreamStatus()
-_stream_thread = None
-_stream_thread_stop = threading.Event()
-
-def get_camera_stream_url():
-    c = config["camera"]
-    url = c["url"]
-    if not url:
-        # Compose from components
-        ip = os.environ.get("CAMERA_IP")
-        port = os.environ.get("CAMERA_PORT", "80")
-        proto = "http"
-        stream_path = c.get("stream_path") or "/Streaming/channels/101/httpPreview"
-        if ip:
-            url = f"{proto}://{ip}:{port}{stream_path}"
-        else:
-            url = ""
-    return url
-
-def _connect_camera_stream():
-    url = get_camera_stream_url()
-    auth = None
-    if config["camera"]["username"]:
-        auth = (config["camera"]["username"], config["camera"]["password"])
-    headers = {"Accept": "multipart/x-mixed-replace"}
-    try:
-        resp = requests.get(url, auth=auth, headers=headers, stream=True, timeout=5)
-        resp.raise_for_status()
-        return resp
-    except Exception as ex:
-        stream_status.error(str(ex))
-        return None
-
-def _parse_mjpeg_stream(resp):
-    boundary = None
-    content_type = resp.headers.get("Content-Type", "")
-    if "boundary=" in content_type:
-        boundary = content_type.split("boundary=", 1)[1]
-        if boundary.startswith('"') and boundary.endswith('"'):
-            boundary = boundary[1:-1]
-        if not boundary.startswith("--"):
-            boundary = "--" + boundary
-    else:
-        boundary = "--myboundary"
-    delimiter = boundary.encode()
-    buffer = b''
-    for chunk in resp.iter_content(chunk_size=4096):
-        if _stream_thread_stop.is_set():
-            break
-        buffer += chunk
-        while True:
-            idx = buffer.find(delimiter)
-            if idx == -1:
-                break
-            part = buffer[:idx]
-            buffer = buffer[idx + len(delimiter):]
-            if b'Content-Type: image/jpeg' in part:
-                start = part.find(b'\r\n\r\n')
-                if start != -1:
-                    jpeg_data = part[start+4:]
-                    yield jpeg_data
-            # else ignore non-jpeg part
-
-def _forward_stream_to_mqtt():
-    global stream_status
-    stream_status.start()
-    mqtt_cfg = config["mqtt"]
-    client = mqtt.Client(mqtt_cfg.get("client_id", "hikvision_forwarder"))
-    if mqtt_cfg.get("username"):
-        client.username_pw_set(mqtt_cfg["username"], mqtt_cfg.get("password", ""))
-    if mqtt_cfg.get("tls"):
-        client.tls_set()
-    try:
-        client.connect(mqtt_cfg["host"], mqtt_cfg["port"])
-    except Exception as ex:
-        stream_status.error("MQTT connect error: %s" % str(ex))
-        stream_status.stop()
-        return
-    client.loop_start()
-    resp = _connect_camera_stream()
-    if not resp:
-        stream_status.stop()
-        client.loop_stop()
-        return
-    try:
-        for jpeg_data in _parse_mjpeg_stream(resp):
-            if _stream_thread_stop.is_set():
-                break
-            client.publish(mqtt_cfg["topic"], jpeg_data)
-            stream_status.frame()
-    except Exception as ex:
-        stream_status.error("Streaming error: %s" % str(ex))
-    finally:
-        client.loop_stop()
-        stream_status.stop()
-
-def start_forwarding():
-    global _stream_thread, _stream_thread_stop
-    if stream_status.active:
-        return False
-    _stream_thread_stop.clear()
-    _stream_thread = threading.Thread(target=_forward_stream_to_mqtt, daemon=True)
-    _stream_thread.start()
-    return True
-
-def stop_forwarding():
-    global _stream_thread, _stream_thread_stop
-    _stream_thread_stop.set()
-    if _stream_thread and _stream_thread.is_alive():
-        _stream_thread.join(timeout=2)
-    stream_status.stop()
+def update_status():
+    global status, forwarder
+    if status["forwarding"] and status["start_time"]:
+        status["uptime"] = int(time.time() - status["start_time"])
+        if forwarder:
+            status["frames_published"] = forwarder.frames_published
+            status["fps"] = forwarder.fps
+            status["last_error"] = forwarder.last_error
 
 @app.route("/config", methods=["GET"])
 def get_config():
-    return jsonify(config)
+    return jsonify(persisted)
 
 @app.route("/config", methods=["PUT"])
-def update_config():
-    body = request.get_json(force=True)
-    config.update(body)
-    save_config(config)
-    return jsonify({"status": "ok", "config": config})
+def put_config():
+    data = request.get_json(force=True)
+    cam = data.get("camera")
+    mqttconf = data.get("mqtt")
+    if cam:
+        persisted["camera"].update(cam)
+    if mqttconf:
+        persisted["mqtt"].update(mqttconf)
+    return jsonify(persisted)
 
 @app.route("/camera/settings", methods=["PUT"])
 def camera_settings():
-    body = request.get_json(force=True)
-    config["camera"].update(body)
-    save_config(config)
-    return jsonify({"status": "ok", "camera": config["camera"]})
+    data = request.get_json(force=True)
+    persisted["camera"].update(data)
+    return jsonify({"status": "ok", "camera": persisted["camera"]})
 
 @app.route("/mqtt/settings", methods=["PUT"])
 def mqtt_settings():
-    body = request.get_json(force=True)
-    config["mqtt"].update(body)
-    save_config(config)
-    return jsonify({"status": "ok", "mqtt": config["mqtt"]})
-
-@app.route("/stream/forward", methods=["POST"])
-def api_stream_forward():
-    if stream_status.active:
-        return jsonify({"status": "already_started"}), 202
-    started = start_forwarding()
-    if started:
-        return jsonify({"status": "started"}), 202
-    else:
-        return jsonify({"status": "failed", "error": stream_status.last_error}), 500
+    data = request.get_json(force=True)
+    persisted["mqtt"].update(data)
+    return jsonify({"status": "ok", "mqtt": persisted["mqtt"]})
 
 @app.route("/stream/start", methods=["POST"])
-def api_stream_start():
-    return api_stream_forward()
+@app.route("/stream/forward", methods=["POST"])
+def stream_start():
+    global forwarder, status
+    with forwarder_lock:
+        if status["forwarding"]:
+            return jsonify({"status": "already running"}), 409
+        forwarder = StreamForwarder(dict(persisted["camera"]), dict(persisted["mqtt"]))
+        forwarder.daemon = True
+        status["forwarding"] = True
+        status["start_time"] = time.time()
+        status["frames_published"] = 0
+        status["last_error"] = None
+        forwarder.start()
+    return jsonify({"status": "forwarding started"}), 202
 
 @app.route("/stream/stop", methods=["POST"])
 @app.route("/stream/forward", methods=["DELETE"])
-def api_stream_stop():
-    stop_forwarding()
-    return jsonify({"status": "stopped"})
+def stream_stop():
+    global forwarder, status
+    with forwarder_lock:
+        if not status["forwarding"]:
+            return jsonify({"status": "not running"}), 409
+        if forwarder:
+            forwarder.stop()
+            forwarder.join(timeout=5)
+        status["forwarding"] = False
+        status["uptime"] = int(time.time() - status["start_time"]) if status["start_time"] else 0
+        status["start_time"] = None
+    return jsonify({"status": "forwarding stopped"})
 
 @app.route("/stream/status", methods=["GET"])
-def stream_status_query():
-    return jsonify(stream_status.to_dict())
+def stream_status():
+    update_status()
+    return jsonify({
+        "forwarding": status["forwarding"],
+        "uptime": status["uptime"],
+        "frames_published": status["frames_published"],
+        "fps": status.get("fps", 0),
+        "last_error": status["last_error"]
+    })
 
-@app.route("/video", methods=["GET"])
-def serve_video():
-    # Proxy MJPEG stream over HTTP for browser/CLI viewing
-    resp = _connect_camera_stream()
-    if not resp:
-        return "Could not connect to camera", 502
-    boundary = None
-    content_type = resp.headers.get("Content-Type", "")
-    if "boundary=" in content_type:
-        boundary = content_type.split("boundary=", 1)[1]
-        if boundary.startswith('"') and boundary.endswith('"'):
-            boundary = boundary[1:-1]
-        if not boundary.startswith("--"):
-            boundary = "--" + boundary
-    else:
-        boundary = "--myboundary"
-    multipart_boundary = boundary
-
+# HTTP MJPEG stream proxy endpoint (for browser/CLI view)
+@app.route("/stream/http", methods=["GET"])
+def http_stream():
+    cam = persisted["camera"]
+    url = cam.get("url") or f'{cam["protocol"]}://{cam["ip"]}:{cam["port"]}{cam["stream_path"]}'
+    auth = None
+    if cam.get("username"):
+        auth = (cam["username"], cam["password"])
     def generate():
-        for jpeg_data in _parse_mjpeg_stream(resp):
-            yield (b"%s\r\nContent-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n" % (
-                multipart_boundary.encode(), len(jpeg_data))) + jpeg_data + b'\r\n'
-            if _stream_thread_stop.is_set():
-                break
-
-    headers = {
-        "Content-Type": "multipart/x-mixed-replace; boundary=%s" % multipart_boundary[2:]
-    }
-    return Response(stream_with_context(generate()), headers=headers)
+        with requests.get(url, stream=True, auth=auth, timeout=10) as r:
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            yield f'HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\n\r\n'.encode("utf-8")
+            for chunk in r.iter_content(chunk_size=4096):
+                yield chunk
+    # Properly pass through content-type and multipart boundary for MJPEG
+    with requests.get(url, stream=True, auth=auth, timeout=10) as r:
+        ct = r.headers.get("Content-Type", "")
+    return Response(stream_with_context(generate()), content_type=ct)
 
 if __name__ == "__main__":
     app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
