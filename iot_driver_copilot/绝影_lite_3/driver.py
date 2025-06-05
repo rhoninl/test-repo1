@@ -1,236 +1,275 @@
 import os
 import sys
-import time
-import yaml
 import json
+import yaml
+import time
 import threading
-from datetime import datetime
-from typing import Any, Dict
+import signal
 
-from kubernetes import client, config, watch
+from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
 import paho.mqtt.client as mqtt
 
-EDGEDEVICE_NAME = os.environ.get('EDGEDEVICE_NAME')
-EDGEDEVICE_NAMESPACE = os.environ.get('EDGEDEVICE_NAMESPACE')
-MQTT_BROKER_ADDRESS = os.environ.get('MQTT_BROKER_ADDRESS')
-MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', f'deviceshifu-{EDGEDEVICE_NAME or "unknown"}')
-MQTT_KEEPALIVE = int(os.environ.get('MQTT_KEEPALIVE', '60'))
-MQTT_USERNAME = os.environ.get('MQTT_USERNAME')
-MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD')
-MQTT_TLS_ENABLED = os.environ.get('MQTT_TLS_ENABLED', 'false').lower() == 'true'
-
-INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions'
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
+INSTRUCTION_CONFIG_PATH = "/etc/edgedevice/config/instructions"
 
 if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
     print("Missing required environment variables.", file=sys.stderr)
     sys.exit(1)
 
-# Kubernetes client setup
+# Load Kubernetes in-cluster configuration
 config.load_incluster_config()
-crd = client.CustomObjectsApi()
-core_v1 = client.CoreV1Api()
+crd_api = client.CustomObjectsApi()
 
-EDGEDEVICE_GROUP = 'shifu.edgenesis.io'
-EDGEDEVICE_VERSION = 'v1alpha1'
-EDGEDEVICE_PLURAL = 'edgedevices'
+CRD_GROUP = 'shifu.edgenesis.io'
+CRD_VERSION = 'v1alpha1'
+CRD_PLURAL = 'edgedevices'
 
-def get_edgedevice() -> Dict[str, Any]:
+# Load instructions config
+def load_instruction_config():
     try:
-        return crd.get_namespaced_custom_object(
-            EDGEDEVICE_GROUP, EDGEDEVICE_VERSION,
-            EDGEDEVICE_NAMESPACE, EDGEDEVICE_PLURAL, EDGEDEVICE_NAME
+        with open(INSTRUCTION_CONFIG_PATH, 'r') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"Failed to load instructions config: {e}", file=sys.stderr)
+        return {}
+
+INSTRUCTION_CONFIG = load_instruction_config()
+
+# MQTT Topics and QoS mapping from API info
+API_DEFINITIONS = {
+    "move": {
+        "topic": "device/commands/move",
+        "qos": 1,
+        "type": "publish"
+    },
+    "stand": {
+        "topic": "device/commands/stand",
+        "qos": 1,
+        "type": "publish"
+    },
+    "heartbeat": {
+        "topic": "device/commands/heartbeat",
+        "qos": 1,
+        "type": "publish"
+    },
+    "telemetry_state": {
+        "topic": "device/telemetry/state",
+        "qos": 1,
+        "type": "subscribe"
+    }
+}
+
+# Status phases
+PHASE_PENDING = "Pending"
+PHASE_RUNNING = "Running"
+PHASE_FAILED = "Failed"
+PHASE_UNKNOWN = "Unknown"
+
+# Global for telemetry cache
+telemetry_state_cache = None
+telemetry_state_lock = threading.Lock()
+
+def update_edgedevice_phase(phase):
+    try:
+        # Fetch latest EdgeDevice
+        ed = crd_api.get_namespaced_custom_object(
+            group=CRD_GROUP,
+            version=CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=CRD_PLURAL,
+            name=EDGEDEVICE_NAME,
+        )
+        if 'status' not in ed:
+            ed['status'] = {}
+        ed['status']['edgeDevicePhase'] = phase
+        crd_api.patch_namespaced_custom_object_status(
+            group=CRD_GROUP,
+            version=CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=CRD_PLURAL,
+            name=EDGEDEVICE_NAME,
+            body={"status": ed['status']}
         )
     except ApiException as e:
-        return {}
+        print(f"Failed to update EdgeDevice phase: {e}", file=sys.stderr)
 
-def set_edgedevice_phase(phase: str):
-    body = {
-        "status": {
-            "edgeDevicePhase": phase
-        }
-    }
-    for _ in range(3):
-        try:
-            crd.patch_namespaced_custom_object_status(
-                EDGEDEVICE_GROUP, EDGEDEVICE_VERSION, EDGEDEVICE_NAMESPACE,
-                EDGEDEVICE_PLURAL, EDGEDEVICE_NAME, body
-            )
-            return
-        except ApiException:
-            time.sleep(2)
-
-def get_device_address() -> str:
-    ed = get_edgedevice()
-    return ed.get('spec', {}).get('address', '')
-
-def load_instructions() -> dict:
+def get_device_address():
     try:
-        with open(INSTRUCTIONS_PATH, 'r') as f:
-            return yaml.safe_load(f)
-    except Exception:
-        return {}
+        ed = crd_api.get_namespaced_custom_object(
+            group=CRD_GROUP,
+            version=CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=CRD_PLURAL,
+            name=EDGEDEVICE_NAME,
+        )
+        return ed.get('spec', {}).get('address')
+    except ApiException as e:
+        print(f"Failed to get device address: {e}", file=sys.stderr)
+        return None
 
-class DeviceShifuMQTTClient:
-    def __init__(self):
-        self.broker_addr, self.broker_port = self._parse_broker_addr(MQTT_BROKER_ADDRESS)
-        self.client_id = MQTT_CLIENT_ID
-        self.keepalive = MQTT_KEEPALIVE
-        self.username = MQTT_USERNAME
-        self.password = MQTT_PASSWORD
-        self.tls_enabled = MQTT_TLS_ENABLED
+# MQTT Client setup
+class MQTTDeviceClient:
+    def __init__(self, broker_address):
+        self.broker_address = broker_address
+        self.client = mqtt.Client()
+        self.connected = threading.Event()
+        self.should_stop = threading.Event()
+        self.subscribe_topics = []
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_message = self.on_message
 
-        self.client = mqtt.Client(client_id=self.client_id, clean_session=True)
-        if self.username:
-            self.client.username_pw_set(self.username, self.password)
-        if self.tls_enabled:
-            self.client.tls_set()
-        self.client.on_connect = self._on_connect
-        self.client.on_disconnect = self._on_disconnect
-        self.client.on_message = self._on_message
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self.connected.set()
+            update_edgedevice_phase(PHASE_RUNNING)
+            for topic, qos in self.subscribe_topics:
+                client.subscribe(topic, qos)
+        else:
+            update_edgedevice_phase(PHASE_FAILED)
+            print(f"MQTT connect failed: {rc}", file=sys.stderr)
 
-        self.connected = False
-        self.subscriptions = {}
-        self.status_lock = threading.Lock()
-        self.last_status = 'Pending'
-        self.device_address = get_device_address()
-        self.instructions = load_instructions()
-        self.telemetry_data = None
+    def on_disconnect(self, client, userdata, rc):
+        self.connected.clear()
+        if not self.should_stop.is_set():
+            update_edgedevice_phase(PHASE_FAILED)
 
-        self.client_loop_thread = threading.Thread(target=self._loop_forever)
-        self.client_loop_thread.daemon = True
+    def on_message(self, client, userdata, msg):
+        global telemetry_state_cache
+        if msg.topic == API_DEFINITIONS["telemetry_state"]["topic"]:
+            with telemetry_state_lock:
+                try:
+                    telemetry_state_cache = json.loads(msg.payload.decode())
+                except Exception:
+                    telemetry_state_cache = msg.payload.decode()
 
-    @staticmethod
-    def _parse_broker_addr(addr: str):
-        if ':' in addr:
-            host, port = addr.rsplit(':', 1)
-            return host, int(port)
-        return addr, 1883
-
-    def _on_connect(self, client, userdata, flags, rc):
-        self.connected = True
-        self._update_status('Running')
-        # Subscribe to telemetry
-        self.subscribe_telemetry()
-
-    def _on_disconnect(self, client, userdata, rc):
-        self.connected = False
-        self._update_status('Pending' if rc != 0 else 'Unknown')
-
-    def _on_message(self, client, userdata, msg):
-        if msg.topic == 'device/telemetry/state':
-            try:
-                self.telemetry_data = json.loads(msg.payload.decode())
-            except Exception:
-                self.telemetry_data = None
-
-    def _loop_forever(self):
+    def connect_and_loop(self):
+        update_edgedevice_phase(PHASE_PENDING)
         try:
-            self.client.connect(self.broker_addr, self.broker_port, self.keepalive)
-            self.client.loop_forever()
-        except Exception:
-            self._update_status('Failed')
-            while True:
-                time.sleep(5)
+            self.client.connect(self.broker_address.split(":")[0],
+                                int(self.broker_address.split(":")[1]))
+        except Exception as e:
+            update_edgedevice_phase(PHASE_FAILED)
+            print(f"MQTT connect exception: {e}", file=sys.stderr)
+            return
 
-    def start(self):
-        self.client_loop_thread.start()
+        self.client.loop_start()
+        # Wait until connected or timeout
+        for _ in range(30):
+            if self.connected.is_set():
+                return
+            time.sleep(1)
+        update_edgedevice_phase(PHASE_FAILED)
 
-    def _update_status(self, status):
-        with self.status_lock:
-            if self.last_status != status:
-                set_edgedevice_phase(status)
-                self.last_status = status
+    def stop(self):
+        self.should_stop.set()
+        self.client.loop_stop()
+        self.client.disconnect()
+        update_edgedevice_phase(PHASE_UNKNOWN)
 
-    def publish(self, topic, payload, qos=1):
-        if not self.connected:
-            raise RuntimeError("MQTT not connected")
-        info = self.client.publish(topic, json.dumps(payload), qos=qos)
-        info.wait_for_publish()
-        return info.is_published()
+    def add_subscribe(self, topic, qos):
+        self.subscribe_topics.append((topic, qos))
 
-    def subscribe_telemetry(self):
-        self.client.subscribe('device/telemetry/state', qos=1)
+    def publish(self, topic, payload, qos):
+        if not self.connected.is_set():
+            raise Exception("MQTT not connected")
+        result = self.client.publish(topic, json.dumps(payload), qos=qos)
+        result.wait_for_publish()
+        return result.rc == mqtt.MQTT_ERR_SUCCESS
 
-    # Device API methods
-    def move(self, rotate: float, forward: float, lateral: float) -> bool:
-        topic = 'device/commands/move'
-        payload = {'rotate': rotate, 'forward': forward, 'lateral': lateral}
-        qos = self._get_api_qos('move')
-        return self.publish(topic, payload, qos=qos)
+# API Implementation
+class DeviceShifu:
+    def __init__(self):
+        broker = MQTT_BROKER_ADDRESS
+        self.mqtt_client = MQTTDeviceClient(broker)
+        # Setup subscriptions
+        telemetry_topic = API_DEFINITIONS["telemetry_state"]["topic"]
+        telemetry_qos = API_DEFINITIONS["telemetry_state"]["qos"]
+        self.mqtt_client.add_subscribe(telemetry_topic, telemetry_qos)
+        self.mqtt_client.connect_and_loop()
 
-    def stand(self) -> bool:
-        topic = 'device/commands/stand'
-        payload = {'command': 'stand'}
-        qos = self._get_api_qos('stand')
-        return self.publish(topic, payload, qos=qos)
+    def shutdown(self):
+        self.mqtt_client.stop()
 
-    def heartbeat(self) -> bool:
-        topic = 'device/commands/heartbeat'
-        payload = {'timestamp': datetime.utcnow().isoformat() + 'Z'}
-        qos = self._get_api_qos('heartbeat')
-        return self.publish(topic, payload, qos=qos)
+    def publish_move(self, rotate=0, forward=0, lateral=0):
+        # Instruction-based settings can be added here if needed
+        payload = {"rotate": rotate, "forward": forward, "lateral": lateral}
+        topic = API_DEFINITIONS["move"]["topic"]
+        qos = API_DEFINITIONS["move"]["qos"]
+        return self.mqtt_client.publish(topic, payload, qos)
 
-    def get_telemetry_state(self) -> Any:
-        return self.telemetry_data
+    def publish_stand(self):
+        payload = {"command": "stand"}
+        topic = API_DEFINITIONS["stand"]["topic"]
+        qos = API_DEFINITIONS["stand"]["qos"]
+        return self.mqtt_client.publish(topic, payload, qos)
 
-    def _get_api_qos(self, api_name: str) -> int:
-        # Find in instructions or fallback to default
-        inst = self.instructions.get(f'device/commands/{api_name}', {})
-        protocol_list = inst.get('protocolPropertyList', {})
-        return int(protocol_list.get('qos', 1))
+    def publish_heartbeat(self, timestamp=None):
+        if timestamp is None:
+            timestamp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        payload = {"timestamp": timestamp}
+        topic = API_DEFINITIONS["heartbeat"]["topic"]
+        qos = API_DEFINITIONS["heartbeat"]["qos"]
+        return self.mqtt_client.publish(topic, payload, qos)
 
-# HTTP Flask API for user interaction (can be extended as needed)
+    def get_telemetry_state(self):
+        # Returns the most recent cached telemetry state
+        with telemetry_state_lock:
+            return telemetry_state_cache
+
+# API HTTP Server
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-ds_mqtt = DeviceShifuMQTTClient()
-ds_mqtt.start()
+device_shifu = DeviceShifu()
 
-@app.route('/move', methods=['POST'])
+@app.route("/move", methods=["POST"])
 def api_move():
-    params = request.json or {}
-    rotate = float(params.get('rotate', 0))
-    forward = float(params.get('forward', 0))
-    lateral = float(params.get('lateral', 0))
+    data = request.get_json(force=True)
+    rotate = data.get('rotate', 0)
+    forward = data.get('forward', 0)
+    lateral = data.get('lateral', 0)
     try:
-        ok = ds_mqtt.move(rotate, forward, lateral)
-        return jsonify({'success': ok}), 200
+        success = device_shifu.publish_move(rotate=rotate, forward=forward, lateral=lateral)
+        return jsonify({"result": "success" if success else "failed"}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"result": "failed", "error": str(e)}), 500
 
-@app.route('/stand', methods=['POST'])
+@app.route("/stand", methods=["POST"])
 def api_stand():
     try:
-        ok = ds_mqtt.stand()
-        return jsonify({'success': ok}), 200
+        success = device_shifu.publish_stand()
+        return jsonify({"result": "success" if success else "failed"}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"result": "failed", "error": str(e)}), 500
 
-@app.route('/heartbeat', methods=['POST'])
+@app.route("/heartbeat", methods=["POST"])
 def api_heartbeat():
+    timestamp = request.json.get("timestamp") if request.is_json else None
     try:
-        ok = ds_mqtt.heartbeat()
-        return jsonify({'success': ok}), 200
+        success = device_shifu.publish_heartbeat(timestamp=timestamp)
+        return jsonify({"result": "success" if success else "failed"}), 200
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"result": "failed", "error": str(e)}), 500
 
-@app.route('/telemetry/state', methods=['GET'])
-def api_telemetry():
-    data = ds_mqtt.get_telemetry_state()
-    if data is not None:
-        return jsonify(data), 200
-    return jsonify({'error': 'No telemetry data'}), 404
+@app.route("/telemetry/state", methods=["GET"])
+def api_telemetry_state():
+    try:
+        state = device_shifu.get_telemetry_state()
+        return jsonify({"state": state}), 200
+    except Exception as e:
+        return jsonify({"result": "failed", "error": str(e)}), 500
 
-def edgedevice_status_monitor():
-    while True:
-        time.sleep(15)
-        if not ds_mqtt.connected:
-            ds_mqtt._update_status('Pending')
+def sigterm_handler(signum, frame):
+    device_shifu.shutdown()
+    sys.exit(0)
 
-if __name__ == '__main__':
-    monitor_thread = threading.Thread(target=edgedevice_status_monitor)
-    monitor_thread.daemon = True
-    monitor_thread.start()
-    app.run(host='0.0.0.0', port=int(os.environ.get('SHIFU_HTTP_PORT', '8080')))
+signal.signal(signal.SIGTERM, sigterm_handler)
+signal.signal(signal.SIGINT, sigterm_handler)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("HTTP_SERVER_PORT", "8080")))
