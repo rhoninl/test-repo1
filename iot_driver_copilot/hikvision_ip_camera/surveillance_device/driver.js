@@ -1,49 +1,65 @@
-// DeviceShifu for Hikvision IP Camera/Surveillance Device
-// Language: JavaScript (Node.js)
+// DeviceShifu for Hikvision IP Camera - HTTP Server (Node.js)
+// CRD: shifu.edgenesis.io/v1alpha1 EdgeDevice
+// APIs: /snapshot, /streams, /streams/:streamId/preview
 
-const http = require('http');
-const https = require('https');
 const express = require('express');
 const fs = require('fs');
 const yaml = require('js-yaml');
-const path = require('path');
-const { KubeConfig, CustomObjectsApi, PatchUtils } = require('@kubernetes/client-node');
+const k8s = require('@kubernetes/client-node');
+const axios = require('axios');
+const http = require('http');
+const https = require('https');
+const { PassThrough } = require('stream');
 
-// Env Vars
-const EDGEDEVICE_NAME = process.env.EDGEDEVICE_NAME;
-const EDGEDEVICE_NAMESPACE = process.env.EDGEDEVICE_NAMESPACE;
-const DEVICE_SHIFU_HTTP_PORT = process.env.DEVICE_SHIFU_HTTP_PORT || '8080';
-const DEVICE_IP = process.env.DEVICE_IP; // Camera IP
-const DEVICE_HTTP_PORT = process.env.DEVICE_HTTP_PORT || '80';
-const DEVICE_HTTPS_PORT = process.env.DEVICE_HTTPS_PORT || '443';
-const DEVICE_USERNAME = process.env.DEVICE_USERNAME || 'admin';
-const DEVICE_PASSWORD = process.env.DEVICE_PASSWORD || '';
-const DEVICE_USE_HTTPS = process.env.DEVICE_USE_HTTPS === 'true';
+// Environment Variables (required)
+const {
+    EDGEDEVICE_NAME,
+    EDGEDEVICE_NAMESPACE,
+    DEVICE_HTTP_PORT = '8080',
+    DEVICE_SHIFU_HOST = '0.0.0.0',
+    KUBERNETES_SERVICE_HOST,
+    KUBERNETES_SERVICE_PORT,
+    DEVICE_USERNAME,
+    DEVICE_PASSWORD,
+    NODE_TLS_REJECT_UNAUTHORIZED = '1'
+} = process.env;
 
-// Config/Instruction YAML Path
-const INSTRUCTION_PATH = '/etc/edgedevice/config/instructions';
+if (!EDGEDEVICE_NAME || !EDGEDEVICE_NAMESPACE) {
+    console.error('EDGEDEVICE_NAME and EDGEDEVICE_NAMESPACE must be set!');
+    process.exit(1);
+}
 
-const API_GROUP = 'shifu.edgenesis.io';
-const API_VERSION = 'v1alpha1';
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = NODE_TLS_REJECT_UNAUTHORIZED;
+
+// ---- Kubernetes client setup ----
+const kc = new k8s.KubeConfig();
+if (process.env.KUBERNETES_SERVICE_HOST) {
+    // In-cluster config
+    kc.loadFromCluster();
+} else {
+    kc.loadFromDefault();
+}
+const k8sApi = kc.makeApiClient(k8s.CustomObjectsApi);
+
+const CRD_GROUP = 'shifu.edgenesis.io';
+const CRD_VERSION = 'v1alpha1';
 const CRD_PLURAL = 'edgedevices';
 
-let edgeDeviceStatusPhase = 'Unknown'; // Pending/Running/Failed/Unknown
+async function getEdgeDevice() {
+    return k8sApi.getNamespacedCustomObject(
+        CRD_GROUP,
+        CRD_VERSION,
+        EDGEDEVICE_NAMESPACE,
+        CRD_PLURAL,
+        EDGEDEVICE_NAME
+    );
+}
 
-// ------------------- Kubernetes CRD (EdgeDevice) Status Updater -------------------
-
-const kc = new KubeConfig();
-kc.loadFromCluster();
-const k8sCustomApi = kc.makeApiClient(CustomObjectsApi);
-
-// Helper: Patch EdgeDevice status
 async function updateEdgeDevicePhase(phase) {
-    if (!EDGEDEVICE_NAME || !EDGEDEVICE_NAMESPACE) return;
-    if (phase === edgeDeviceStatusPhase) return;
-    edgeDeviceStatusPhase = phase;
     try {
-        await k8sCustomApi.patchNamespacedCustomObjectStatus(
-            API_GROUP,
-            API_VERSION,
+        await k8sApi.patchNamespacedCustomObjectStatus(
+            CRD_GROUP,
+            CRD_VERSION,
             EDGEDEVICE_NAMESPACE,
             CRD_PLURAL,
             EDGEDEVICE_NAME,
@@ -51,274 +67,250 @@ async function updateEdgeDevicePhase(phase) {
             undefined,
             undefined,
             undefined,
-            { headers: { 'Content-Type': PatchUtils.PATCH_FORMAT_JSON_MERGE_PATCH } }
+            { headers: { 'Content-Type': 'application/merge-patch+json' } }
         );
     } catch (e) {
-        // Don't throw, just log
-        console.error('Failed to patch EdgeDevice status:', e.body || e);
+        // Ignore, will retry
     }
 }
 
-// Helper: Fetch EdgeDevice
-async function fetchEdgeDevice() {
-    if (!EDGEDEVICE_NAME || !EDGEDEVICE_NAMESPACE) return null;
+// ---- Load per-API Configurations ----
+const INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions';
+let apiConfig = {};
+try {
+    if (fs.existsSync(INSTRUCTIONS_PATH)) {
+        apiConfig = yaml.load(fs.readFileSync(INSTRUCTIONS_PATH, 'utf8')) || {};
+    }
+} catch (e) {
+    apiConfig = {};
+}
+
+// ---- Device Address and ISAPI endpoints ----
+let DEVICE_ADDRESS = '';
+let DEVICE_PROTOCOL = 'http';
+let DEVICE_PORT = 80;
+let IS_HTTPS = false;
+
+async function refreshDeviceAddress() {
     try {
-        const resp = await k8sCustomApi.getNamespacedCustomObject(
-            API_GROUP,
-            API_VERSION,
-            EDGEDEVICE_NAMESPACE,
-            CRD_PLURAL,
-            EDGEDEVICE_NAME
-        );
-        return resp.body;
-    } catch (e) {
-        return null;
-    }
-}
-
-// ------------------- Load API Instructions from ConfigMap -------------------
-let apiInstructions = {};
-function loadApiInstructions() {
-    try {
-        const files = fs.readdirSync(INSTRUCTION_PATH);
-        apiInstructions = {};
-        files.forEach(f => {
-            const full = path.join(INSTRUCTION_PATH, f);
-            const doc = yaml.load(fs.readFileSync(full, 'utf8'));
-            Object.assign(apiInstructions, doc);
-        });
-    } catch (e) {
-        // No instructions or error, fallback to empty
-        apiInstructions = {};
-    }
-}
-loadApiInstructions();
-
-// ------------------- Hikvision ISAPI/HTTP Camera Helpers -------------------
-
-// Basic Auth header
-function getAuthHeader() {
-    if (!DEVICE_USERNAME || !DEVICE_PASSWORD) return {};
-    const auth = Buffer.from(`${DEVICE_USERNAME}:${DEVICE_PASSWORD}`).toString('base64');
-    return { 'Authorization': `Basic ${auth}` };
-}
-
-// HTTP/HTTPS client
-function getHttpClient() {
-    return DEVICE_USE_HTTPS ? https : http;
-}
-function getDeviceHost() {
-    return DEVICE_IP + ':' + (DEVICE_USE_HTTPS ? DEVICE_HTTPS_PORT : DEVICE_HTTP_PORT);
-}
-function getDeviceBaseUrl() {
-    return (DEVICE_USE_HTTPS ? 'https' : 'http') + '://' + getDeviceHost();
-}
-function getApiSettings(apiName) {
-    return (apiInstructions[apiName] && apiInstructions[apiName].protocolPropertyList) || {};
-}
-
-// Helper: Test device connectivity (fetch system info)
-async function testConnectivity() {
-    const url = getDeviceBaseUrl() + '/ISAPI/System/deviceInfo';
-    return new Promise((resolve, reject) => {
-        const opts = {
-            method: 'GET',
-            headers: { ...getAuthHeader() },
-            timeout: 3000,
-        };
-        getHttpClient().get(url, opts, res => {
-            if (res.statusCode === 200) resolve(true);
-            else resolve(false);
-        }).on('error', () => resolve(false));
-    });
-}
-
-// Helper: Get available video streams
-async function getStreamsList() {
-    // Use ISAPI: /ISAPI/Streaming/channels
-    const url = getDeviceBaseUrl() + '/ISAPI/Streaming/channels';
-    return new Promise((resolve, reject) => {
-        const opts = {
-            method: 'GET',
-            headers: { ...getAuthHeader() },
-            timeout: 4000,
-        };
-        let buf = '';
-        getHttpClient().get(url, opts, res => {
-            if (res.statusCode !== 200) return resolve([]);
-            res.setEncoding('utf8');
-            res.on('data', d => buf += d);
-            res.on('end', () => {
-                // Parse XML, extract stream info
-                try {
-                    const parseString = require('xml2js').parseString;
-                    parseString(buf, (err, result) => {
-                        if (err || !result || !result.StreamingChannelList) return resolve([]);
-                        const chs = result.StreamingChannelList.StreamingChannel;
-                        let streams = [];
-                        if (Array.isArray(chs)) {
-                            for (const ch of chs) {
-                                let id = ch.id && ch.id[0];
-                                let enabled = ch.enabled && ch.enabled[0] === 'true';
-                                let video = ch.Video && ch.Video[0];
-                                let resolution = video && video.resolution && video.resolution[0];
-                                let codec = video && video.codec && video.codec[0];
-                                streams.push({
-                                    id: id,
-                                    status: enabled ? 'online' : 'offline',
-                                    resolution: resolution || '',
-                                    codec: codec || '',
-                                });
-                            }
-                        }
-                        resolve(streams);
-                    });
-                } catch (e) {
-                    resolve([]);
+        const dev = await getEdgeDevice();
+        const spec = dev.body && dev.body.spec;
+        if (spec && spec.address) {
+            let addr = spec.address;
+            if (/^https?:\/\//i.test(addr)) {
+                DEVICE_ADDRESS = addr.replace(/\/$/, '');
+                DEVICE_PROTOCOL = addr.startsWith('https') ? 'https' : 'http';
+                IS_HTTPS = DEVICE_PROTOCOL === 'https';
+                const m = addr.match(/^https?:\/\/([^:/]+)(?::(\d+))?/);
+                if (m) {
+                    DEVICE_PORT = m[2] ? parseInt(m[2], 10) : (IS_HTTPS ? 443 : 80);
                 }
-            });
-        }).on('error', () => resolve([]));
+            } else {
+                DEVICE_ADDRESS = `${DEVICE_PROTOCOL}://${addr}`;
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+// ---- Device connectivity check ----
+async function testDeviceConnection() {
+    if (!DEVICE_ADDRESS) {
+        await refreshDeviceAddress();
+    }
+    try {
+        // Use ISAPI: get device info
+        const url = `${DEVICE_ADDRESS}/ISAPI/System/deviceInfo`;
+        await axios.get(url, {
+            timeout: 3000,
+            auth: DEVICE_USERNAME && DEVICE_PASSWORD ? { username: DEVICE_USERNAME, password: DEVICE_PASSWORD } : undefined,
+            httpAgent: IS_HTTPS ? undefined : new http.Agent({ keepAlive: true }),
+            httpsAgent: IS_HTTPS ? new https.Agent({ rejectUnauthorized: NODE_TLS_REJECT_UNAUTHORIZED === '1' }) : undefined,
+            validateStatus: s => s < 500
+        });
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// ---- Device phase management ----
+let devicePhase = 'Pending';
+let devicePhaseLast = '';
+let deviceCheckTimer = null;
+function devicePhaseLoop() {
+    setInterval(async () => {
+        let newPhase = 'Unknown';
+        if (!DEVICE_ADDRESS) {
+            await refreshDeviceAddress();
+            newPhase = 'Pending';
+        }
+        if (DEVICE_ADDRESS) {
+            const ok = await testDeviceConnection();
+            newPhase = ok ? 'Running' : 'Failed';
+        }
+        devicePhase = newPhase;
+        if (devicePhaseLast !== newPhase) {
+            devicePhaseLast = newPhase;
+            updateEdgeDevicePhase(newPhase);
+        }
+    }, 5000);
+}
+
+// ---- Helper: HTTP Basic Auth ----
+function getAuthHeader() {
+    if (DEVICE_USERNAME && DEVICE_PASSWORD) {
+        const b64 = Buffer.from(`${DEVICE_USERNAME}:${DEVICE_PASSWORD}`).toString('base64');
+        return { Authorization: `Basic ${b64}` };
+    }
+    return {};
+}
+
+// ---- API: /snapshot ----
+async function getSnapshot(channel = 'main') {
+    // Hikvision ISAPI: /ISAPI/Streaming/channels/101/picture
+    // channel: 'main' => 101, 'sub' => 102, 'third' => 103
+    const channelMap = { main: '101', sub: '102', third: '103' };
+    const chId = channelMap[channel] || channelMap.main;
+    const url = `${DEVICE_ADDRESS}/ISAPI/Streaming/channels/${chId}/picture`;
+    return axios.get(url, {
+        responseType: 'stream',
+        timeout: 4000,
+        headers: getAuthHeader(),
+        httpAgent: IS_HTTPS ? undefined : new http.Agent({ keepAlive: true }),
+        httpsAgent: IS_HTTPS ? new https.Agent({ rejectUnauthorized: NODE_TLS_REJECT_UNAUTHORIZED === '1' }) : undefined,
+        validateStatus: s => s < 500
     });
 }
 
-// Helper: Get snapshot JPEG buffer for a channel
-async function getSnapshotBuffer(channelId) {
-    // ISAPI: /ISAPI/Streaming/channels/<id>/picture
-    // channelId: e.g. '101' (main), '102' (sub), '103' (third)
-    const url = getDeviceBaseUrl() + `/ISAPI/Streaming/channels/${channelId}/picture`;
-    return new Promise((resolve, reject) => {
-        const opts = {
-            method: 'GET',
-            headers: { ...getAuthHeader() },
-            timeout: 5000,
-        };
-        getHttpClient().get(url, opts, res => {
-            if (res.statusCode !== 200) return resolve(null);
-            let bufs = [];
-            res.on('data', d => bufs.push(d));
-            res.on('end', () => resolve(Buffer.concat(bufs)));
-        }).on('error', () => resolve(null));
-    });
+// ---- API: /streams ----
+async function getStreams() {
+    // Query main/sub/third streams
+    const ids = ['101', '102', '103'];
+    const names = { '101': 'main', '102': 'sub', '103': 'third' };
+    let results = [];
+    await Promise.all(
+        ids.map(async id => {
+            try {
+                const url = `${DEVICE_ADDRESS}/ISAPI/Streaming/channels/${id}`;
+                const res = await axios.get(url, {
+                    timeout: 4000,
+                    headers: getAuthHeader(),
+                    httpAgent: IS_HTTPS ? undefined : new http.Agent({ keepAlive: true }),
+                    httpsAgent: IS_HTTPS ? new https.Agent({ rejectUnauthorized: NODE_TLS_REJECT_UNAUTHORIZED === '1' }) : undefined,
+                    validateStatus: s => s < 500
+                });
+                if (res.status === 200 && res.data) {
+                    // Parse XML for stream info (codec, resolution, enable)
+                    const xml2js = require('xml2js');
+                    const parsed = await xml2js.parseStringPromise(res.data, { explicitArray: false });
+                    const ch = parsed && parsed.StreamingChannel;
+                    if (ch && ch['enabled'] === 'true') {
+                        results.push({
+                            id: names[id],
+                            streamId: id,
+                            codec: ch['videoCodecType'] || '',
+                            resolution: ch['Video'] && ch['Video']['videoResolutionWidth'] && ch['Video']['videoResolutionHeight'] ?
+                                `${ch['Video']['videoResolutionWidth']}x${ch['Video']['videoResolutionHeight']}` : '',
+                            status: 'enabled'
+                        });
+                    }
+                }
+            } catch (e) {
+                // ignore
+            }
+        })
+    );
+    return results;
 }
 
-// Helper: Get MJPEG HTTP stream for a channel
-function proxyMjpegStream(channelId, clientRes) {
-    // ISAPI MJPEG: /ISAPI/Streaming/channels/<id>/httpPreview
-    const url = getDeviceBaseUrl() + `/ISAPI/Streaming/channels/${channelId}/httpPreview`;
-    const opts = {
-        method: 'GET',
-        headers: { ...getAuthHeader() },
-    };
+// ---- API: /streams/:streamId/preview ----
+// Convert Hikvision JPEG-push (multipart/x-mixed-replace) to HTTP MJPEG
+async function proxyMjpegStream(streamId, res) {
+    // Hikvision ISAPI: /ISAPI/Streaming/channels/{id}/httpPreview
+    const channelMap = { main: '101', sub: '102', third: '103' };
+    const chId = channelMap[streamId] || channelMap.main;
+    const url = `${DEVICE_ADDRESS}/ISAPI/Streaming/channels/${chId}/httpPreview`;
+    try {
+        const response = await axios({
+            url,
+            method: 'get',
+            responseType: 'stream',
+            headers: {
+                ...getAuthHeader(),
+                'Accept': 'multipart/x-mixed-replace'
+            },
+            timeout: 8000,
+            httpAgent: IS_HTTPS ? undefined : new http.Agent({ keepAlive: true }),
+            httpsAgent: IS_HTTPS ? new https.Agent({ rejectUnauthorized: NODE_TLS_REJECT_UNAUTHORIZED === '1' }) : undefined,
+            validateStatus: s => s < 500
+        });
 
-    const deviceReq = getHttpClient().request(url, opts, deviceRes => {
-        if (!String(deviceRes.headers['content-type'] || '').includes('multipart/x-mixed-replace')) {
-            clientRes.status(502).send('Device does not provide MJPEG stream');
-            deviceRes.resume();
+        if (response.status !== 200) {
+            res.status(503).end('Camera not streaming');
             return;
         }
-        clientRes.status(200);
-        clientRes.setHeader('Content-Type', deviceRes.headers['content-type']);
-        // Pipe directly
-        deviceRes.pipe(clientRes);
-    });
 
-    deviceReq.on('error', (err) => {
-        clientRes.status(502).send('Failed to connect to device stream');
-    });
-    deviceReq.end();
+        // Proxy the multipart MJPEG stream transparently
+        res.setHeader('Content-Type', 'multipart/x-mixed-replace;boundary=--frame');
+        response.data.pipe(res);
+    } catch (e) {
+        res.status(502).end('Failed to connect to device stream');
+    }
 }
 
-// Map channel string to channelId
-function channelStringToId(channel) {
-    // 'main' => '101', 'sub' => '102', 'third' => '103'
-    if (channel === 'main') return '101';
-    if (channel === 'sub') return '102';
-    if (channel === 'third') return '103';
-    if (/^\d+$/.test(channel)) return channel;
-    return '101';
-}
-
-// ------------------- Express API Setup -------------------
-
+// ---- Express Server Setup ----
 const app = express();
 
-// Health endpoint
-app.get('/healthz', (req, res) => res.send('ok'));
-
-// API 1: GET /snapshot?channel=main
 app.get('/snapshot', async (req, res) => {
-    const settings = getApiSettings('snapshot');
-    const channel = req.query.channel || settings.channel || 'main';
-    const channelId = channelStringToId(channel);
-
-    const buf = await getSnapshotBuffer(channelId);
-    if (!buf) {
-        res.status(502).send('Failed to retrieve snapshot');
+    if (devicePhase !== 'Running') {
+        res.status(503).json({ error: 'Device not connected' });
         return;
     }
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.send(buf);
-});
-
-// API 2: GET /streams
-app.get('/streams', async (req, res) => {
-    const settings = getApiSettings('streams');
-    const streams = await getStreamsList();
-    // Map ids: 101 -> main, 102 -> sub, 103 -> third
-    const idMap = { '101': 'main', '102': 'sub', '103': 'third' };
-    const result = streams.map(s => ({
-        id: idMap[s.id] || s.id,
-        resolution: s.resolution,
-        codec: s.codec,
-        status: s.status,
-    }));
-    res.json(result);
-});
-
-// API 3: GET /streams/:streamId/preview
-app.get('/streams/:streamId/preview', async (req, res) => {
-    const settings = getApiSettings('preview');
-    const streamId = req.params.streamId;
-    const channelId = channelStringToId(streamId);
-    proxyMjpegStream(channelId, res);
-});
-
-// ------------------- DeviceShifu Main Loop -------------------
-
-async function main() {
-    // Attempt to retrieve device address from EdgeDevice CRD if not set
-    if (!DEVICE_IP) {
-        const edgeDevice = await fetchEdgeDevice();
-        if (edgeDevice && edgeDevice.spec && edgeDevice.spec.address) {
-            process.env.DEVICE_IP = edgeDevice.spec.address;
+    const channel = req.query.channel || 'main';
+    try {
+        const snapshotRes = await getSnapshot(channel);
+        if (snapshotRes.status === 200) {
+            res.setHeader('Content-Type', 'image/jpeg');
+            snapshotRes.data.pipe(res);
+        } else {
+            res.status(snapshotRes.status).end('Snapshot not available');
         }
+    } catch (e) {
+        res.status(502).end('Device snapshot error');
     }
+});
 
-    // Device status management loop
-    async function deviceStatusLoop() {
-        let lastStatus = 'Unknown';
-        setInterval(async () => {
-            let phase = 'Unknown';
-            if (!DEVICE_IP) {
-                phase = 'Pending';
-            } else {
-                const ok = await testConnectivity();
-                phase = ok ? 'Running' : 'Failed';
-            }
-            await updateEdgeDevicePhase(phase);
-        }, 5000);
+app.get('/streams', async (req, res) => {
+    if (devicePhase !== 'Running') {
+        res.status(503).json({ error: 'Device not connected' });
+        return;
     }
+    try {
+        const streams = await getStreams();
+        res.json({ streams });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to retrieve streams' });
+    }
+});
 
-    // Start HTTP server
-    app.listen(DEVICE_SHIFU_HTTP_PORT, () => {
-        console.log(`DeviceShifu HTTP server listening on ${DEVICE_SHIFU_HTTP_PORT}`);
+app.get('/streams/:streamId/preview', async (req, res) => {
+    if (devicePhase !== 'Running') {
+        res.status(503).json({ error: 'Device not connected' });
+        return;
+    }
+    const { streamId } = req.params;
+    await proxyMjpegStream(streamId, res);
+});
+
+// ---- Start everything ----
+(async () => {
+    await refreshDeviceAddress();
+    devicePhaseLoop();
+    app.listen(parseInt(DEVICE_HTTP_PORT, 10), DEVICE_SHIFU_HOST, () => {
+        console.log(
+            `DeviceShifu HTTP server running at http://${DEVICE_SHIFU_HOST}:${DEVICE_HTTP_PORT}`
+        );
     });
-
-    // Start status loop
-    deviceStatusLoop();
-}
-
-// Reload config on SIGHUP
-process.on('SIGHUP', () => loadApiInstructions());
-
-main();
+})();
